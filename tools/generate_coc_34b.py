@@ -1,22 +1,24 @@
-"""Alpamayo 2 Super (34B) teacher CoC 데이터셋 생성기.
+"""Alpamayo 2 Super (34B) teacher CoC dataset generator.
 
-10B 버전에서 얻은 교훈을 그대로 반영한다:
-  - 카메라 객체를 클립당 한 번만 열고 t0를 여러 개 처리한다 (30배 차이)
-  - JPEG를 **먼저** 만들고 그것을 디코드한 프레임으로 추론한다.
-    원본으로 추론하고 JPEG를 저장하면 (저장 이미지 -> 저장 CoC) 쌍이 어긋난다.
-    실측: q92 압축만으로 6개 중 1개의 CoC가 뒤집히고 ADE가 1.14m 움직였다.
-  - t0 grid를 클립별 영상 길이로 클램프한다 (영상은 ~20s, egomotion은 ~140s)
-  - 샘플 단위 ADE를 원본 그대로 저장한다. 임계값은 나중에 바꿀 수 있어야 한다.
+Lessons carried over from the 10B version:
+  Open camera objects once per clip and process many t0 values (30x difference).
+  Encode the JPEG first and run inference on the decoded frames. Running
+    inference on the originals and storing a JPEG misaligns the stored image
+    against the stored CoC. Measured: q92 compression alone flips 1 of 6 CoC
+    outputs and moves ADE by 1.14m.
+  Clamp the t0 grid to each clip's video length (video is ~20s, egomotion ~140s).
+  Store per sample ADE raw. The threshold must remain changeable later.
 
-34B 고유 사항:
-  - **7카메라 전부 저장한다.** trajectory 태스크는 (0,1,2,3,5,6), vqa는 (0,1,2,3,4,5)를
-    쓰므로 합집합이 7대다. 학습 때 빼는 건 되지만 없는 걸 추가할 수는 없다.
-    추론에는 select_task_input()이 고른 부분집합만 들어간다.
-  - 모델이 69GB라 GPU당 워커 2개가 상한.
+Specific to the 34B:
+  Store all 7 cameras. The trajectory task uses (0,1,2,3,5,6) and vqa uses
+    (0,1,2,3,4,5), so the union is 7. Cameras can be dropped at training time
+    but never added back. Inference receives only the subset select_task_input
+    returns.
+  The model is 69GB, so 2 workers per GPU is the ceiling.
 
-GPU를 다른 사람이 써야 할 수 있으므로 언제든 중단·재개 가능하다:
-  SIGTERM/SIGINT를 받으면 shard를 flush하고 종료하며, 재시작하면
-  (clip_id, t0_us) 키로 남은 것부터 이어서 한다.
+Someone else may need the GPUs, so this can be stopped and resumed at any time.
+On SIGTERM or SIGINT the shards are flushed before exit, and a restart continues
+from the remaining (clip_id, t0_us) keys.
 """
 
 import argparse
@@ -58,8 +60,8 @@ def parse_args() -> argparse.Namespace:
         "--t0-end",
         type=float,
         default=18.0,
-        help="seconds. 영상이 대개 20초를 못 채워 t0=20은 81%의 클립에서 클램프된다. "
-        "그러면 완료된 클립에도 미완 t0가 남아 재시작마다 클립을 다시 열게 된다(워커당 3시간).",
+        help="seconds. Video usually falls short of 20s, so t0=20 is clamped on 81% of clips. "
+        "That leaves an unfinished t0 on completed clips, reopening them on every restart (3 hours per worker).",
     )
     p.add_argument("--t0-step", type=float, default=2.0, help="seconds")
     p.add_argument("--num-traj-samples", type=int, default=6)
@@ -69,12 +71,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--ade-threshold", type=float, default=1.0, help="meters")
     p.add_argument("--shard-rows", type=int, default=512)
-    p.add_argument("--flush-seconds", type=float, default=300.0, help="주기 flush 간격")
+    p.add_argument("--flush-seconds", type=float, default=300.0, help="periodic flush interval")
     p.add_argument("--jpeg-quality", type=int, default=92)
-    p.add_argument("--topk", type=int, default=20, help="토큰별 상위 k개 분포 저장 (0=끔)")
-    p.add_argument("--encode-threads", type=int, default=4, help="JPEG 인코딩 병렬도")
-    p.add_argument("--t0-timeout", type=int, default=300, help="t0 하나의 상한(초) — 멈춤 방지")
-    p.add_argument("--clip-open-timeout", type=int, default=600, help="클립 열기 상한(초)")
+    p.add_argument("--topk", type=int, default=20, help="store top-k distribution per token (0 disables)")
+    p.add_argument("--encode-threads", type=int, default=4, help="JPEG encoding parallelism")
+    p.add_argument("--t0-timeout", type=int, default=300, help="per t0 ceiling in seconds, prevents hangs")
+    p.add_argument("--clip-open-timeout", type=int, default=600, help="clip open ceiling in seconds")
     return p.parse_args()
 
 
@@ -83,7 +85,7 @@ def log(msg: str) -> None:
 
 
 def smart_size(w: int, h: int, min_px: int, max_px: int, factor: int = 32) -> tuple[int, int]:
-    """Qwen3-VL 프로세서가 고르는 것과 같은 크기(factor의 배수, 픽셀수 구간 내)."""
+    """Same size the Qwen3-VL processor picks: a multiple of factor, within the pixel range."""
     import math
 
     hb = max(factor, round(h / factor) * factor)
@@ -100,7 +102,7 @@ def smart_size(w: int, h: int, min_px: int, max_px: int, factor: int = 32) -> tu
 
 
 def ego_window(egomotion, t0_us: int) -> dict[str, np.ndarray]:
-    """t0 기준 로컬 프레임의 history / future 궤적."""
+    """History and future trajectory in the local frame at t0."""
     hist_off = np.arange(
         -(NUM_HISTORY_STEPS - 1) * TIME_STEP * 1e6, TIME_STEP * 1e6 / 2, TIME_STEP * 1e6
     ).astype(np.int64)
@@ -114,7 +116,7 @@ def ego_window(egomotion, t0_us: int) -> dict[str, np.ndarray]:
     f_xyz, f_quat = f.pose.translation, f.pose.rotation.as_quat()
 
     t0_xyz = h_xyz[-1].copy()
-    t0_quat = h_quat[-1].copy()  # scipy 규약: xyzw
+    t0_quat = h_quat[-1].copy()  # scipy convention: xyzw
     r_inv = spt.Rotation.from_quat(t0_quat).inv()
     return {
         "hist_xyz": r_inv.apply(h_xyz - t0_xyz),
@@ -122,7 +124,7 @@ def ego_window(egomotion, t0_us: int) -> dict[str, np.ndarray]:
         "fut_xyz": r_inv.apply(f_xyz - t0_xyz),
         "fut_rot": (r_inv * spt.Rotation.from_quat(f_quat)).as_matrix(),
         "t0_xyz": t0_xyz,
-        # 모델은 wxyz 순서의 역회전 쿼터니언을 받는다
+        # the model expects the inverse rotation quaternion in wxyz order
         "t0_inv_quat_wxyz": np.array(
             [t0_quat[3], -t0_quat[0], -t0_quat[1], -t0_quat[2]], dtype=np.float32
         ),
@@ -145,15 +147,15 @@ SCHEMA = pa.schema(
         ("gt_rot", pa.list_(pa.float32())),  # 64*9
         ("hist_xyz", pa.list_(pa.float32())),  # 16*3
         ("hist_rot", pa.list_(pa.float32())),  # 16*9
-        # 시퀀스 logprob (선택된 토큰들의 log P 합) — teacher 확신도 신호.
-        # 모델이 반환하는 `logprob`은 전부 0인 placeholder라 직접 계산한다.
+        # Sequence logprob (sum of log P over chosen tokens): a teacher confidence signal.
+        # The `logprob` the model returns is an all zero placeholder, so compute it here.
         ("seq_logprob", pa.float32()),
         ("num_gen_tokens", pa.int32()),
-        # token-level KD용 top-k 분포. 34B와 Qwen3-VL student는 텍스트 토크나이저가
-        # 완전히 같으므로(151,669 토큰 일치) 이 분포를 그대로 KL 타깃으로 쓸 수 있다.
-        # 저장 비용 16 KB/t0 = 프레임 대비 +1.2%.
+        # Top-k distribution for token level KD. The 34B and Qwen3-VL students share
+        # an identical text tokenizer (all 151,669 tokens match), so this can be used
+        # directly as a KL target. Cost is 16 KB per t0, about 1.2% of the frames.
         ("gen_token_ids", pa.list_(pa.int32())),  # steps
-        ("topk_ids", pa.list_(pa.int32())),  # steps*k, 행 우선
+        ("topk_ids", pa.list_(pa.int32())),  # steps*k, row major
         ("topk_logprobs", pa.list_(pa.float32())),  # steps*k
         ("topk_k", pa.int32()),
         ("num_prompt_tokens", pa.int32()),
@@ -162,14 +164,14 @@ SCHEMA = pa.schema(
         ("seed", pa.int32()),
         ("temperature", pa.float32()),
         ("top_p", pa.float32()),
-        # 추론에 실제로 들어간 카메라 (저장된 7대의 부분집합)
+        # cameras actually fed to inference (a subset of the stored 7)
         ("input_camera_ids", pa.list_(pa.int32())),
     ]
 )
 
-# 클립별로 t0가 실제로 가능한 구간. 클립을 열어야만 알 수 있는 값이라 캐시한다.
-# 이게 없으면 영상이 짧은 클립은 재시작할 때마다 "남은 t0"가 있는 것처럼 보여
-# 클립을 다시 열고(40~55초) 나서야 버리게 된다.
+# The interval where t0 is actually valid for a clip. Only knowable by opening
+# the clip, so it is cached. Without this, short clips look like they still have
+# pending t0 on every restart and get reopened (40 to 55 seconds) only to be discarded.
 RANGE_SCHEMA = pa.schema(
     [
         ("clip_id", pa.string()),
@@ -182,14 +184,14 @@ FRAME_SCHEMA = pa.schema(
     [
         ("clip_id", pa.string()),
         ("t0_us", pa.int64()),
-        # 저장은 항상 canonical 7카메라 ring (0..6) 순서
+        # always stored in the canonical 7 camera ring order (0..6)
         ("camera_indices", pa.list_(pa.int32())),
         ("num_frames_per_camera", pa.int32()),
         ("width", pa.int32()),
         ("height", pa.int32()),
         ("jpeg_quality", pa.int32()),
-        ("jpegs", pa.list_(pa.binary())),  # 7*4 = 28장, 카메라 순 -> 프레임 순
-        # 실차 재현에 필요한 타이밍 (모델은 0.1s 간격을 전제한다)
+        ("jpegs", pa.list_(pa.binary())),  # 7*4 = 28 images, camera major then frame
+        # timing needed for in vehicle reproduction (the model assumes 0.1s spacing)
         ("relative_timestamps", pa.list_(pa.float32())),  # 7*4
         ("absolute_timestamps", pa.list_(pa.int64())),  # 7*4
     ]
@@ -197,7 +199,7 @@ FRAME_SCHEMA = pa.schema(
 
 
 class ShardWriter:
-    """행을 모아 shard 단위 parquet으로 flush (lustre 소파일 회피)."""
+    """Buffer rows and flush as parquet shards, avoiding many small files on lustre."""
 
     def __init__(self, out_dir: str, prefix: str, schema, worker_id: int, shard_rows: int):
         self.dir = out_dir
@@ -226,13 +228,13 @@ class ShardWriter:
         tmp = self._path(self.shard) + ".tmp"
         pq.write_table(table, tmp, compression="zstd")
         os.replace(tmp, self._path(self.shard))
-        log(f"  shard 저장: {os.path.basename(self._path(self.shard))} ({len(self.rows)} rows)")
+        log(f"  shard written: {os.path.basename(self._path(self.shard))} ({len(self.rows)} rows)")
         self.rows = []
         self.shard += 1
 
 
 def already_done(out_dir: str) -> set:
-    """기존 samples shard에서 (clip_id, t0_us) 키를 읽어 재개를 지원."""
+    """Read (clip_id, t0_us) keys from existing samples shards to support resume."""
     done = set()
     sub = os.path.join(out_dir, "samples")
     if not os.path.isdir(sub):
@@ -244,12 +246,12 @@ def already_done(out_dir: str) -> set:
             t = pq.read_table(os.path.join(sub, fn), columns=["clip_id", "t0_us"])
             done.update(zip(t.column("clip_id").to_pylist(), t.column("t0_us").to_pylist()))
         except Exception as e:
-            log(f"  경고: {fn} 읽기 실패 ({type(e).__name__}), 무시")
+            log(f"  warning: {fn} read failed ({type(e).__name__}), ignoring")
     return done
 
 
 def load_ranges(out_dir: str) -> dict:
-    """클립별 t0 가능 구간 캐시를 읽는다. {clip_id: (lo_us, hi_us)}"""
+    """Load the per clip valid t0 interval cache. {clip_id: (lo_us, hi_us)}"""
     ranges: dict = {}
     sub = os.path.join(out_dir, "ranges")
     if not os.path.isdir(sub):
@@ -266,15 +268,16 @@ def load_ranges(out_dir: str) -> dict:
             ):
                 ranges[c] = (lo, hi)
         except Exception as e:
-            log(f"  경고: {fn} 읽기 실패 ({type(e).__name__}), 무시")
+            log(f"  warning: {fn} read failed ({type(e).__name__}), ignoring")
     return ranges
 
 
 def snapshot_config(out_dir: str, model, args: argparse.Namespace) -> None:
-    """실차 이식에 필요한 규격을 데이터셋에 같이 박아둔다.
+    """Embed the specification needed for in vehicle porting alongside the dataset.
 
-    궤적 출력은 unicycle 액션 공간의 정규화 상수에 묶여 있다. 차량 동역학이
-    다르면 같은 토큰이 다른 궤적을 뜻하므로, 모델 config와 분리해 보관하면 안 된다.
+    Trajectory output is tied to the normalization constants of the unicycle
+    action space. With different vehicle dynamics the same tokens mean a
+    different trajectory, so this must not be separated from the model config.
     """
     path = os.path.join(out_dir, "_dataset_config.json")
     if os.path.exists(path):
@@ -308,7 +311,7 @@ def snapshot_config(out_dir: str, model, args: argparse.Namespace) -> None:
         "token_layout",
     ):
         meta[key] = getattr(cfg, key, None)
-    # expert_config는 dict일 수도 PretrainedConfig 객체일 수도 있다
+    # expert_config may be a dict or a PretrainedConfig object
     expert = getattr(cfg, "expert_config", None)
 
     def _sub(name: str):
@@ -323,7 +326,7 @@ def snapshot_config(out_dir: str, model, args: argparse.Namespace) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(path, "w") as f:
         json.dump(meta, f, indent=2, default=str)
-    log(f"config 스냅샷 저장: {path}")
+    log(f"config snapshot saved: {path}")
 
 
 def main() -> None:
@@ -339,10 +342,11 @@ def main() -> None:
     from alpamayo2_super.input_profiles import select_task_input
     from alpamayo2_super.models.alpamayo2_super import Alpamayo2Super
 
-    # helper.prepare_model_inputs()가 t0마다 get_processor()를 부르고, 그 안에서
-    # AutoProcessor.from_pretrained()가 매번 디스크를 읽어 프로세서를 새로 만든다.
-    # 계측 결과 tokenize 구간이 전체의 34~46%로 최대 병목이었다(추론은 14~17%).
-    # 프로세서는 (tokenizer, config)가 고정이면 항상 같으므로 한 번만 만든다.
+    # helper.prepare_model_inputs() calls get_processor() on every t0, and inside it
+    # AutoProcessor.from_pretrained() reads from disk and rebuilds the processor.
+    # Profiling showed tokenize was 34 to 46% of runtime, the largest phase
+    # (inference was 14 to 17%). The processor is constant for a fixed
+    # (tokenizer, config), so build it once.
     _proc_cache: dict = {}
     _orig_get_processor = helper.get_processor
 
@@ -353,20 +357,20 @@ def main() -> None:
 
     helper.get_processor = _cached_get_processor
 
-    canonical_names = list(CAMERA_NAMES_TO_INDICES)  # 0..6 순서
+    canonical_names = list(CAMERA_NAMES_TO_INDICES)  # order 0..6
     canonical_ids = list(CAMERA_NAMES_TO_INDICES.values())
 
     clips = pd.read_parquet(args.clips_file)["clip_id"].tolist()
     if args.max_clips:
         clips = clips[: args.max_clips]
     mine = clips[args.worker_id :: args.num_workers]
-    log(f"worker {args.worker_id}/{args.num_workers}: 담당 클립 {len(mine)}개, GPU {args.gpu}")
+    log(f"worker {args.worker_id}/{args.num_workers}: {len(mine)} clips assigned, GPU {args.gpu}")
 
     out_dir = args.out
     done = already_done(out_dir)
-    log(f"이미 생성된 (clip,t0): {len(done)}개 — 건너뜀")
+    log(f"already generated (clip,t0): {len(done)}, skipping")
     clip_ranges = load_ranges(out_dir)
-    log(f"t0 구간 캐시: {len(clip_ranges)}개 클립 — 열기 전에 걸러냄")
+    log(f"t0 interval cache: {len(clip_ranges)} clips, filtered before opening")
 
     avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
     cam_feats = [getattr(avdi.features.CAMERA, n.upper()) for n in canonical_names]
@@ -375,12 +379,12 @@ def main() -> None:
         args.model, dtype=torch.bfloat16, device_map=f"cuda:{args.gpu}"
     )
     model.eval()
-    log("모델 로드 완료 (34B)")
+    log("model loaded (34B)")
 
-    # 토큰별 분포를 붙잡는다. `_generate_with_shared_prefill`이 내부에서
-    # generation_config.output_logits = False 로 덮어쓰므로 바깥에서 설정해도 소용없다.
-    # 실제 generate 호출 지점을 감싸는 게 유일하게 깨끗한 개입점이다.
-    # 실측: 시간·메모리 증가 없음 (로짓은 어차피 계산되고, 스텝 수가 ~23으로 짧다).
+    # Capture the per token distribution. `_generate_with_shared_prefill` overwrites
+    # generation_config.output_logits = False internally, so setting it outside does nothing.
+    # Wrapping the actual generate call is the only clean intervention point.
+    # Measured: no time or memory increase (logits are computed anyway and the
     captured: dict = {}
     if args.topk > 0:
         _orig_generate = model.vlm.generate
@@ -395,7 +399,7 @@ def main() -> None:
             return out
 
         model.vlm.generate = _generate_capturing
-        log(f"토큰 분포 저장 활성화 (top-{args.topk})")
+        log(f"token distribution capture enabled (top-{args.topk})")
     snapshot_config(out_dir, model, args)
 
     writer = ShardWriter(
@@ -409,13 +413,13 @@ def main() -> None:
         max(1, args.shard_rows // 12),
     )
 
-    # 구간 캐시는 행이 작고 재시작 때 가장 먼저 필요하므로 자주 flush 한다
+    # interval cache rows are small and needed first on restart, so flush often
     range_writer = ShardWriter(
         os.path.join(out_dir, "ranges"), "range", RANGE_SCHEMA, args.worker_id, 64
     )
 
     def _flush_and_exit(signum, _frame):
-        log(f"신호 {signum} 수신 — shard flush 후 종료 (재시작하면 이어서 진행)")
+        log(f"signal {signum} received: flushing shards and exiting (restart resumes)")
         try:
             writer.flush()
             frame_writer.flush()
@@ -427,7 +431,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _flush_and_exit)
 
     def _on_timeout(_signum, _frame):
-        raise TimeoutError(f"t0 처리가 {args.t0_timeout}s를 넘김")
+        raise TimeoutError(f"t0 processing exceeded {args.t0_timeout}s")
 
     signal.signal(signal.SIGALRM, _on_timeout)
     pool = ThreadPoolExecutor(max_workers=args.encode_threads)
@@ -435,20 +439,21 @@ def main() -> None:
     t0_grid_s = np.arange(args.t0_start, args.t0_end + 1e-9, args.t0_step)
     tgt_w = tgt_h = None
     n_ok = n_pass = n_fail = 0
-    # 구간별 누적 시간 — GPU가 노는 이유를 실측으로 가리기 위한 계측
+    # Cumulative time per phase, to identify why the GPU idles
     phase = {"open": 0.0, "decode": 0.0, "encode": 0.0, "tokenize": 0.0, "infer": 0.0, "post": 0.0}
     t_start = last_flush = time.time()
 
     def _open_clip(cid: str):
-        """egomotion + 7카메라를 연다. 클립당 ~56초의 네트워크 스트리밍."""
+        """Open egomotion and 7 cameras. About 56 seconds of network streaming per clip."""
         e = avdi.get_clip_feature(cid, avdi.features.LABELS.EGOMOTION, maybe_stream=True)
         cs = [avdi.get_clip_feature(cid, c, maybe_stream=True) for c in cam_feats]
         return e, cs
 
     def _pending_for(cid: str) -> list:
-        """아직 안 만든 t0. 구간 캐시가 있으면 **클립을 열기 전에** 걸러낸다.
+        """Pending t0 values. With an interval cache these are filtered before opening.
 
-        캐시가 없으면(처음 보는 클립) 열어봐야 알 수 있으므로 그대로 둔다.
+        Without a cache (a clip seen for the first time) the interval is unknown
+        until the clip is opened, so nothing is filtered.
         """
         p = [int(round(s * 1e6)) for s in t0_grid_s if (cid, int(round(s * 1e6))) not in done]
         rng = clip_ranges.get(cid)
@@ -460,8 +465,8 @@ def main() -> None:
     def _has_work(cid: str) -> bool:
         return bool(_pending_for(cid))
 
-    # 클립 열기(56s)가 클립당 wall-clock의 26%인데 그동안 CPU도 GPU도 논다.
-    # 현재 클립의 t0를 처리하는 동안 다음 클립을 미리 열어 그 구간을 숨긴다.
+    # Clip opening (56s) is 26% of per clip wall clock, and both CPU and GPU idle
+    # Prefetch the next clip while the current clip's t0 values run, hiding that window.
     prefetch_pool = ThreadPoolExecutor(max_workers=1)
     prefetch: dict[str, object] = {}
 
@@ -476,7 +481,7 @@ def main() -> None:
     for ci, clip_id in enumerate(mine):
         pending = _pending_for(clip_id)
         if not pending:
-            continue  # 캐시 덕에 클립을 열지 않고 넘어간다
+            continue  # the cache lets us skip without opening the clip
         try:
             signal.alarm(args.clip_open_timeout)
             _t_open = time.time()
@@ -487,15 +492,15 @@ def main() -> None:
                 ego, cams = _open_clip(clip_id)
             phase["open"] += time.time() - _t_open
             signal.alarm(0)
-            _schedule_prefetch(ci + 1)  # 다음 클립을 미리 연다
+            _schedule_prefetch(ci + 1)  # prefetch the next clip
         except Exception as e:
             signal.alarm(0)
             prefetch.pop("future", None)
             prefetch.pop("clip_id", None)
-            log(f"[{ci+1}/{len(mine)}] {clip_id[:8]} 클립 열기 실패: {type(e).__name__} {str(e)[:90]}")
+            log(f"[{ci+1}/{len(mine)}] {clip_id[:8]} clip open failed: {type(e).__name__} {str(e)[:90]}")
             continue
 
-        # 영상 길이는 클립마다 다르고 egomotion보다 훨씬 짧다 (~20s vs ~140s)
+        # Video length varies per clip and is far shorter than egomotion (~20s vs ~140s)
         try:
             lo = max(int(c.timestamps.min()) for c in cams) + (NUM_FRAMES - 1) * int(
                 TIME_STEP * 1e6
@@ -505,27 +510,27 @@ def main() -> None:
                 min(int(c.timestamps.max()) for c in cams),
                 int(ego.timestamps.max()) - int((NUM_FUTURE_STEPS + 1) * TIME_STEP * 1e6),
             )
-            # 다음 실행부터는 이 클립을 열지 않고 걸러낼 수 있게 구간을 남긴다
+            # record the interval so later runs can filter without opening the clip
             if clip_id not in clip_ranges:
                 clip_ranges[clip_id] = (lo, hi)
                 range_writer.add({"clip_id": clip_id, "lo_us": lo, "hi_us": hi})
             kept = [t for t in pending if lo <= t <= hi]
             if len(kept) != len(pending):
                 log(
-                    f"  {clip_id[:8]} t0 클램프 [{lo/1e6:.1f}, {hi/1e6:.1f}]s: "
+                    f"  {clip_id[:8]} t0 clamp [{lo/1e6:.1f}, {hi/1e6:.1f}]s: "
                     f"{len(pending)} -> {len(kept)}"
                 )
             pending = kept
             if not pending:
                 continue
         except Exception as e:
-            log(f"  {clip_id[:8]} 범위 계산 실패({type(e).__name__}), 원래 grid 사용")
+            log(f"  {clip_id[:8]} interval computation failed ({type(e).__name__}), using the original grid")
 
         n_clip = 0
         for t0_us in pending:
             try:
-                # 네트워크 스트리밍이 걸려 워커가 영영 멈추는 걸 막는다.
-                # 정상 t0는 10초대이므로 넉넉히 잡아도 사고만 걸러낸다.
+                # Prevent a worker from hanging forever on stalled network streaming.
+                # A healthy t0 takes about 10 seconds, so a generous ceiling only catches faults.
                 signal.alarm(args.t0_timeout)
                 _t = time.time()
                 img_ts = np.array(
@@ -544,8 +549,8 @@ def main() -> None:
                     absolute_timestamps - absolute_timestamps.min()
                 ).float() * 1e-6
 
-                # JPEG를 먼저 만들고 그것을 디코드한 프레임으로 추론한다.
-                # 순서를 바꾸면 저장 이미지와 저장 CoC의 쌍이 어긋난다.
+                # Build the JPEG first, then run inference on the decoded frames.
+                # Reversing the order misaligns the stored image against the stored CoC.
                 if tgt_w is None:
                     tgt_w, tgt_h = smart_size(
                         int(image_frames.shape[-1]),
@@ -554,12 +559,12 @@ def main() -> None:
                         model.config.max_pixels,
                     )
                     log(
-                        f"  프레임 저장 크기: {image_frames.shape[-1]}x{image_frames.shape[-2]}"
+                        f"  stored frame size: {image_frames.shape[-1]}x{image_frames.shape[-2]}"
                         f" -> {tgt_w}x{tgt_h} ({tgt_w*tgt_h} px, q{args.jpeg_quality}), "
-                        f"카메라 {len(cams)}대"
+                        f"{len(cams)} cameras"
                     )
-                # 28장 인코딩이 GPU 추론(2.8s)보다 오래 걸린다. PIL은 인코딩 중
-                # GIL을 놓으므로 스레드로 병렬화하면 그대로 이득이다.
+                # Encoding 28 images takes longer than GPU inference (2.8s). PIL releases
+                # the GIL while encoding, so threading it is a direct win.
                 def _encode(img):
                     pil = Image.fromarray(img.permute(1, 2, 0).numpy())
                     if (pil.width, pil.height) != (tgt_w, tgt_h):
@@ -580,9 +585,9 @@ def main() -> None:
 
                 traj = ego_window(ego, t0_us)
                 camera_tmin = int(absolute_timestamps.min().item())
-                # load_physical_aiavdataset()의 반환 계약을 그대로 재현한다.
-                # 카메라를 클립당 한 번만 열려고 그 함수를 안 쓰는 것이므로,
-                # 키가 하나라도 빠지면 select_task_input에서 걸린다.
+                # Reproduce the load_physical_aiavdataset() return contract exactly.
+                # We avoid that function to open cameras only once per clip, so a single
+                # missing key is caught by select_task_input.
                 source_data = {
                     "image_frames": image_frames,
                     "camera_indices": torch.tensor(canonical_ids, dtype=torch.int64),
@@ -614,7 +619,7 @@ def main() -> None:
                     "t0_us": t0_us,
                     "clip_id": clip_id,
                 }
-                # 저장은 7대 전부, 추론에는 태스크가 요구하는 부분집합만
+                # store all 7, feed inference only the subset the task requires
                 data = select_task_input(source_data, args.task)
                 used_ids = [int(x) for x in data["camera_indices"].tolist()]
 
@@ -645,19 +650,19 @@ def main() -> None:
                 prot = pred_rot.float().cpu().numpy().reshape(-1, NUM_FUTURE_STEPS, 3, 3)
                 ade = np.linalg.norm(pxyz[:, :, :2] - gt_xyz[None, :, :2], axis=-1).mean(-1)
 
-                # 토큰별 top-k 분포와 실제 시퀀스 logprob을 뽑는다.
-                # 모델이 반환하는 logprob은 zeros_like(...)라 쓸 수 없다.
+                # Extract the per token top-k distribution and the real sequence logprob.
+                # The logprob the model returns is zeros_like(...) and unusable.
                 topk_ids = topk_lps = gen_ids = None
                 seq_lp = None
                 if captured.get("logits"):
-                    # 스텝을 통째로 stack하면 (B, steps, 155776) fp32를 한 번에 잡는다.
-                    # steps가 상한(256)에 가까우면 957MB고, GPU가 이미 98% 차 있어
-                    # 할당자가 스래싱한다. 스텝별로 처리하면 피크가 (B, 155776)=3.7MB로
-                    # 고정된다. topk는 정규화에 불변이므로 원본 로짓에서 골라도 된다.
-                    # 스텝마다 .cpu()를 부르면 스텝 수 x 3 회의 동기화 전송이 생기고
-                    # 매번 GPU 큐를 기다린다(42스텝이면 126회, 실측 +7초/t0).
-                    # topk 결과는 (B, k)로 아주 작으므로 GPU에 모아두었다가
-                    # 마지막에 한 번만 옮긴다. 피크 메모리는 스텝별 처리 그대로 유지된다.
+                    # Stacking all steps allocates (B, steps, 155776) fp32 at once, which
+                    # is 957MB near the 256 step ceiling. With the GPU already 98% full
+                    # the allocator thrashes. Per step processing pins the peak at
+                    # (B, 155776) = 3.7MB. topk is invariant to normalization, so it can
+                    # Calling .cpu() per step creates steps x 3 synchronizing transfers,
+                    # each waiting on the GPU queue (126 for 42 steps, measured +7s per t0).
+                    # The topk results are tiny at (B, k), so accumulate them on the GPU
+                    # and transfer once at the end. Peak memory stays as low as per step.
                     steps = len(captured["logits"])
                     chosen = captured["sequences"][:, -steps:]  # (B, steps)
                     tk_v, tk_i, ch_lp = [], [], []
@@ -741,7 +746,7 @@ def main() -> None:
                 n_ok += 1
                 n_clip += 1
 
-                # 주기 flush — 언제 중단돼도 잃는 작업을 이 간격으로 제한한다
+                # periodic flush bounds the work lost to an interruption
                 if time.time() - last_flush > args.flush_seconds:
                     writer.flush()
                     frame_writer.flush()
@@ -751,7 +756,7 @@ def main() -> None:
                 n_fail += 1
                 if n_fail <= 5 or n_fail % 50 == 0:
                     log(
-                        f"  {clip_id[:8]} t0={t0_us/1e6:.1f}s 실패: "
+                        f"  {clip_id[:8]} t0={t0_us/1e6:.1f}s failed: "
                         f"{type(e).__name__} {str(e)[:110]}"
                     )
             finally:
@@ -759,11 +764,11 @@ def main() -> None:
 
         el = time.time() - t_start
         tot = sum(phase.values()) or 1.0
-        log("  구간%: " + " ".join(f"{k}={100*v/tot:.0f}" for k, v in phase.items())
-            + f"  (합 {tot:.0f}s / 경과 {el:.0f}s)")
+        log("  phase%: " + " ".join(f"{k}={100*v/tot:.0f}" for k, v in phase.items())
+            + f"  (sum {tot:.0f}s / elapsed {el:.0f}s)")
         log(
             f"[{ci+1}/{len(mine)}] {clip_id[:8]} +{n_clip}t0  "
-            f"누적 t0={n_ok} 통과샘플={n_pass} 실패={n_fail}  "
+            f"cum t0={n_ok} passed={n_pass} failed={n_fail}  "
             f"{n_ok/el*3600 if el else 0:.0f} t0/h"
         )
 
@@ -786,7 +791,7 @@ def main() -> None:
             f,
             indent=2,
         )
-    log(f"완료: t0={n_ok} 통과샘플={n_pass} 실패={n_fail}")
+    log(f"done: t0={n_ok} passed={n_pass} failed={n_fail}")
 
 
 if __name__ == "__main__":

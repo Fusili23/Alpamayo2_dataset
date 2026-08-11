@@ -1,15 +1,17 @@
-"""Alpamayo 2 Super — 카메라 수·프레임 수에 따른 지연 시간 측정.
+"""Alpamayo 2 Super: inference latency by camera count and frame count.
 
-Thor 배포에서 prefill이 감당 가능한지 판단하려면 "카메라를 줄이면 얼마나 빨라지는가"를
-알아야 한다. 입력 토큰은 카메라 수에 선형이지만 attention은 제곱이라 지연은 초선형일 수 있다.
+To judge whether prefill is affordable on Thor we need to know how much faster
+inference gets when cameras are removed. Input tokens scale linearly with camera
+count, but attention is quadratic, so latency may scale superlinearly.
 
-측정 항목:
-  - 프롬프트 토큰 수 (구성만으로 정해지는 값)
-  - prefill 지연 (max_new_tokens=1 로 근사)
-  - 전체 지연 (CoC 생성 + diffusion expert 궤적)
-  - 품질 (minADE) — 카메라를 줄였을 때의 대가
+Measured:
+  prompt token count (determined purely by configuration)
+  prefill latency (approximated with max_new_tokens=1)
+  total latency (CoC generation plus diffusion expert trajectory)
+  quality (minADE), the cost of dropping cameras
 
-배포 시나리오를 가정해 num_traj_samples=1 로 잰다(데이터 생성 때의 6과 다름).
+Uses num_traj_samples=1 to model a deployment scenario, unlike the 6 used for
+dataset generation.
 """
 
 import argparse
@@ -48,7 +50,7 @@ def main() -> None:
     from alpamayo2_super.load_physical_aiavdataset import load_physical_aiavdataset
     from alpamayo2_super.models.alpamayo2_super import Alpamayo2Super
 
-    # 프로세서는 한 번만 (t0마다 새로 만들면 그 비용이 측정에 섞인다)
+    # build the processor once; rebuilding per t0 would pollute the measurement
     _cache: dict = {}
     _orig = helper.get_processor
 
@@ -59,12 +61,12 @@ def main() -> None:
 
     helper.get_processor = _cached
 
-    print(f"클립 로드: {args.clip_id} @ t0={args.t0_us/1e6:.1f}s", flush=True)
+    print(f"loading clip: {args.clip_id} @ t0={args.t0_us/1e6:.1f}s", flush=True)
     source = load_physical_aiavdataset(args.clip_id, t0_us=args.t0_us)
     model = Alpamayo2Super.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map=f"cuda:{args.gpu}"
     ).eval()
-    print("모델 로드 완료\n", flush=True)
+    print("model loaded\n", flush=True)
 
     gt = source["ego_future_xyz"].cpu().numpy()[0, 0]
     base_cams = list(DRIVING_SIX_CAMERA_FOUR_FRAME.camera_ids)  # (0,1,2,3,5,6)
@@ -93,13 +95,13 @@ def main() -> None:
         return n_tok, dt, float(ade)
 
     def bench(label: str, profile: InputProfile) -> dict:
-        # 워밍업 1회 (커널 컴파일·캐시 채우기)
+        # one warmup pass (kernel compilation, cache fill)
         run_once(profile, 256)
         prefills, totals, ades, n_tok = [], [], [], 0
         for _ in range(args.repeats):
-            n_tok, dt1, _ = run_once(profile, 1)  # prefill 근사
+            n_tok, dt1, _ = run_once(profile, 1)  # prefill approximation
             prefills.append(dt1)
-            _, dt2, ade = run_once(profile, 256)  # 전체
+            _, dt2, ade = run_once(profile, 256)  # full
             totals.append(dt2)
             ades.append(ade)
         r = {
@@ -113,32 +115,32 @@ def main() -> None:
             "min_ade": float(np.median(ades)),
         }
         print(
-            f"  {label:16s} 이미지 {r['images']:2d}  토큰 {r['prompt_tokens']:5d}  "
-            f"prefill {r['prefill_s']:.3f}s  전체 {r['total_s']:.3f}s  minADE {r['min_ade']:.3f}",
+            f"  {label:16s} images {r['images']:2d}  tokens {r['prompt_tokens']:5d}  "
+            f"prefill {r['prefill_s']:.3f}s  total {r['total_s']:.3f}s  minADE {r['min_ade']:.3f}",
             flush=True,
         )
         return r
 
     results = []
-    print("=== 카메라 수 변화 (프레임 4 고정) ===", flush=True)
+    print("=== varying camera count (4 frames fixed) ===", flush=True)
     for n in range(1, 7):
         results.append(
-            bench(f"{n}카메라x4프레임", InputProfile(tuple(base_cams[:n]), (0, 1, 2, 3)))
+            bench(f"{n}cam x 4frame", InputProfile(tuple(base_cams[:n]), (0, 1, 2, 3)))
         )
 
-    print("\n=== 프레임 수 변화 (6카메라 고정) ===", flush=True)
+    print("\n=== varying frame count (6 cameras fixed) ===", flush=True)
     for fr in ((3,), (2, 3), (1, 2, 3)):
         results.append(
-            bench(f"6카메라x{len(fr)}프레임", InputProfile(tuple(base_cams), fr))
+            bench(f"6cam x {len(fr)}frame", InputProfile(tuple(base_cams), fr))
         )
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\n저장: {args.out}")
+    print(f"\nsaved: {args.out}")
 
     base = next(r for r in results if r["cameras"] == 6 and r["frames"] == 4)
-    print("\n=== 6카메라x4프레임 대비 ===")
-    print("구성                 토큰      전체지연     속도향상   minADE")
+    print("\n=== relative to 6 cameras x 4 frames ===")
+    print("config              tokens    total        speedup    minADE")
     for r in results:
         print(
             f"  {r['label']:16s} {r['prompt_tokens']:5d}  {r['total_s']:7.3f}s  "

@@ -1,15 +1,17 @@
-"""Alpamayo teacher CoC 데이터셋 생성기.
+"""Alpamayo 1.5 (10B) teacher CoC dataset generator. Kept for reference.
 
-클립 하나당 카메라를 한 번만 열고 여러 t0를 처리한다 (카메라 open 30초 vs
-t0당 decode 1.4초 — 재사용이 30배 이득). 샘플마다 teacher가 뽑은 CoC 텍스트와
-trajectory, 그리고 GT 대비 ADE를 함께 기록한다.
+Opens cameras once per clip and processes many t0 values (30 seconds to open a
+camera versus 1.4 seconds to decode a t0, so reuse is a 30x win). For each sample
+it records the CoC text and trajectory the teacher produced along with ADE
+against ground truth.
 
-필터링 정책: num_traj_samples개 각각이 자기 CoC 텍스트를 가지므로, 폐기 단위는
-t0가 아니라 **샘플 하나**다. 각 샘플의 ADE를 그대로 저장하고 `pass_filter`
-불리언을 같이 넣는다. 임계값을 나중에 바꿔도 원본 재순회가 필요 없다.
+Filtering policy: each of the num_traj_samples outputs carries its own CoC text,
+so the unit of rejection is a single sample, not a t0. Each sample's ADE is
+stored raw with a `pass_filter` boolean alongside, so the threshold can change
+later without revisiting the source.
 
-사용:
-  python generate_coc_dataset.py --worker-id 0 --num-workers 4 --gpu 0
+This is the 10B version, superseded by generate_coc_34b.py. It uses 4 cameras,
+which is incompatible with the 34B six camera configuration.
 """
 
 import argparse
@@ -68,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-frames",
         action="store_true",
-        help="이미지 저장 생략 (데이터셋이 재학습 시 HF 재스트리밍에 의존하게 됨)",
+        help="skip storing images (the dataset would then depend on re-streaming from HF)",
     )
     return p.parse_args()
 
@@ -78,7 +80,7 @@ def log(msg: str) -> None:
 
 
 def ego_window(egomotion, t0_us: int):
-    """t0 기준 로컬 프레임의 history / future 궤적."""
+    """History and future trajectory in the local frame at t0."""
     hist_off = np.arange(
         -(NUM_HISTORY_STEPS - 1) * TIME_STEP * 1e6, TIME_STEP * 1e6 / 2, TIME_STEP * 1e6
     ).astype(np.int64)
@@ -103,7 +105,7 @@ def ego_window(egomotion, t0_us: int):
 
 
 def build_frames(cams, cam_names, t0_us: int):
-    """카메라별 4프레임을 디코드해 (N_cam, 4, 3, H, W)와 camera_indices 반환."""
+    """Decode 4 frames per camera and return (N_cam, 4, 3, H, W) with camera_indices."""
     ts = np.array(
         [t0_us - (NUM_FRAMES - 1 - i) * int(TIME_STEP * 1e6) for i in range(NUM_FRAMES)],
         dtype=np.int64,
@@ -121,7 +123,7 @@ def build_frames(cams, cam_names, t0_us: int):
 
 
 def smart_size(w: int, h: int, min_px: int, max_px: int, factor: int = 32) -> tuple[int, int]:
-    """Qwen3-VL 프로세서가 고르는 것과 같은 크기(=factor의 배수, 픽셀수 구간 내)."""
+    """Same size the Qwen3-VL processor picks: a multiple of factor, within the pixel range."""
     import math
 
     hb = max(factor, round(h / factor) * factor)
@@ -146,7 +148,7 @@ FRAME_SCHEMA = pa.schema(
         ("width", pa.int32()),
         ("height", pa.int32()),
         ("jpeg_quality", pa.int32()),
-        # 카메라 순서 x 프레임 순서로 평탄화된 JPEG 바이트 (N_cam * num_frames 장)
+        # JPEG bytes flattened camera major then frame (N_cam * num_frames images)
         ("jpegs", pa.list_(pa.binary())),
     ]
 )
@@ -177,7 +179,7 @@ SCHEMA = pa.schema(
 
 
 class ShardWriter:
-    """행을 모아 shard 단위 parquet으로 flush (lustre 소파일 회피)."""
+    """Buffer rows and flush as parquet shards, avoiding many small files on lustre."""
 
     def __init__(self, out_dir: str, prefix: str, schema, worker_id: int, shard_rows: int):
         self.dir = out_dir
@@ -206,13 +208,13 @@ class ShardWriter:
         tmp = self._path(self.shard) + ".tmp"
         pq.write_table(table, tmp, compression="zstd")
         os.replace(tmp, self._path(self.shard))
-        log(f"  shard 저장: {os.path.basename(self._path(self.shard))} ({len(self.rows)} rows)")
+        log(f"  shard written: {os.path.basename(self._path(self.shard))} ({len(self.rows)} rows)")
         self.rows = []
         self.shard += 1
 
 
 def already_done(out_dir: str) -> set:
-    """기존 samples shard에서 (clip_id, t0_us) 키를 읽어 재개를 지원."""
+    """Read (clip_id, t0_us) keys from existing samples shards to support resume."""
     done = set()
     sub = os.path.join(out_dir, "samples")
     if not os.path.isdir(sub):
@@ -224,7 +226,7 @@ def already_done(out_dir: str) -> set:
             t = pq.read_table(os.path.join(sub, fn), columns=["clip_id", "t0_us"])
             done.update(zip(t.column("clip_id").to_pylist(), t.column("t0_us").to_pylist()))
         except Exception as e:
-            log(f"  경고: {fn} 읽기 실패 ({type(e).__name__}), 무시")
+            log(f"  warning: {fn} read failed ({type(e).__name__}), ignoring")
     return done
 
 
@@ -242,11 +244,11 @@ def main() -> None:
     if args.max_clips:
         clips = clips[: args.max_clips]
     mine = clips[args.worker_id :: args.num_workers]
-    log(f"worker {args.worker_id}/{args.num_workers}: 담당 클립 {len(mine)}개, GPU {args.gpu}")
+    log(f"worker {args.worker_id}/{args.num_workers}: {len(mine)} clips assigned, GPU {args.gpu}")
 
     out_dir = args.out
     done = already_done(out_dir)
-    log(f"이미 생성된 (clip,t0) 조합: {len(done)}개 — 건너뜀")
+    log(f"already generated (clip,t0): {len(done)}, skipping")
 
     avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
     cam_feats = [
@@ -260,7 +262,7 @@ def main() -> None:
     model = Alpamayo1_5.from_pretrained(args.model, dtype=torch.bfloat16).to(f"cuda:{args.gpu}")
     model.eval()
     processor = helper.get_processor(model.tokenizer)
-    log("모델 로드 완료")
+    log("model loaded")
 
     writer = ShardWriter(
         os.path.join(out_dir, "samples"), "coc", SCHEMA, args.worker_id, args.shard_rows
@@ -274,9 +276,9 @@ def main() -> None:
         max(1, args.shard_rows // 8),
     )
     def _flush_and_exit(signum, _frame):
-        # 재시작 시 미저장 행이 날아가지 않도록. 재개는 (clip,t0) 키 기준이라
-        # 부분 shard가 남아도 다음 실행이 그대로 이어받는다.
-        log(f"신호 {signum} 수신 — shard flush 후 종료")
+        # Avoid losing unflushed rows on restart. Resume keys on (clip,t0), so a
+        # partial shard is picked up cleanly by the next run.
+        log(f"signal {signum} received: flushing shards and exiting")
         try:
             writer.flush()
             frame_writer.flush()
@@ -300,11 +302,11 @@ def main() -> None:
             ego = avdi.get_clip_feature(clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=True)
             cams = [avdi.get_clip_feature(clip_id, c, maybe_stream=True) for c in cam_feats]
         except Exception as e:
-            log(f"[{ci+1}/{len(mine)}] {clip_id[:8]} 클립 열기 실패: {type(e).__name__} {str(e)[:90]}")
+            log(f"[{ci+1}/{len(mine)}] {clip_id[:8]} clip open failed: {type(e).__name__} {str(e)[:90]}")
             continue
 
-        # 영상 길이는 클립마다 다르고 egomotion보다 훨씬 짧다(관측: ~20s vs ~140s).
-        # 커버되지 않는 t0는 디코드에서 예외가 나므로 미리 잘라낸다.
+        # Video length varies per clip and is far shorter than egomotion (~20s vs ~140s).
+        # Uncovered t0 values raise during decode, so trim them up front.
         try:
             cam_lo = max(int(c.timestamps.min()) for c in cams)
             cam_hi = min(int(c.timestamps.max()) for c in cams)
@@ -315,14 +317,14 @@ def main() -> None:
             kept = [t for t in pending if lo <= t <= hi]
             if len(kept) != len(pending):
                 log(
-                    f"  {clip_id[:8]} t0 범위 클램프 "
+                    f"  {clip_id[:8]} t0 range clamp "
                     f"[{lo/1e6:.1f}, {hi/1e6:.1f}]s: {len(pending)} -> {len(kept)}"
                 )
             pending = kept
             if not pending:
                 continue
         except Exception as e:
-            log(f"  {clip_id[:8]} 범위 계산 실패({type(e).__name__}), 원래 grid 사용")
+            log(f"  {clip_id[:8]} range computation failed ({type(e).__name__}), using the original grid")
 
         n_clip = 0
         for t0_us in pending:
@@ -330,10 +332,10 @@ def main() -> None:
                 frames, cam_idx = build_frames(cams, cam_names, t0_us)
                 traj = ego_window(ego, t0_us)
 
-                # 저장할 JPEG를 **먼저** 만들고 그것을 디코드한 프레임으로 추론한다.
-                # 실측: JPEG q92 압축만으로 6개 중 1개의 CoC가 뒤집히고 ADE가 1.1m까지
-                # 달라진다(리사이즈만이면 0.06m). 원본으로 추론하고 JPEG를 저장하면
-                # (저장 이미지 -> 저장 CoC) 쌍이 어긋나므로 순서가 중요하다.
+                # Build the JPEG to be stored first, then run inference on the decoded
+                # frames. Measured: q92 compression alone flips 1 of 6 CoC outputs and
+                # moves ADE up to 1.14m (resize alone is 0.06m). Inferring on originals
+                # and storing a JPEG misaligns the stored image against the stored CoC.
                 flat = frames.flatten(0, 1)  # (N_cam*num_frames, 3, H, W)
                 jpegs: list[bytes] = []
                 if not args.no_frames:
@@ -345,7 +347,7 @@ def main() -> None:
                             helper.MAX_PIXELS,
                         )
                         log(
-                            f"  프레임 저장 크기: {flat.shape[-1]}x{flat.shape[-2]} -> "
+                            f"  stored frame size: {flat.shape[-1]}x{flat.shape[-2]} -> "
                             f"{tgt_w}x{tgt_h} ({tgt_w*tgt_h} px, q{args.jpeg_quality})"
                         )
                     decoded = []
@@ -427,8 +429,8 @@ def main() -> None:
                             "top_p": args.top_p,
                         }
                     )
-                # 이미지는 t0 단위라 samples 테이블(t0당 S행)과 분리해 저장한다.
-                # 같은 테이블에 넣으면 S배 중복된다.
+                # Images are per t0, so they are stored separately from the samples
+                # table (S rows per t0). Putting them together would duplicate S times.
                 if jpegs:
                     frame_writer.add(
                         {
@@ -448,13 +450,13 @@ def main() -> None:
             except Exception as e:
                 n_fail += 1
                 if n_fail <= 5 or n_fail % 50 == 0:
-                    log(f"  {clip_id[:8]} t0={t0_us/1e6:.1f}s 실패: {type(e).__name__} {str(e)[:110]}")
+                    log(f"  {clip_id[:8]} t0={t0_us/1e6:.1f}s failed: {type(e).__name__} {str(e)[:110]}")
 
         el = time.time() - t_start
         rate = n_ok / el * 3600 if el else 0
         log(
             f"[{ci+1}/{len(mine)}] {clip_id[:8]} +{n_clip}t0  "
-            f"누적 t0={n_ok} 샘플통과={n_pass} 실패={n_fail}  {rate:.0f} t0/h"
+            f"cum t0={n_ok} passed={n_pass} failed={n_fail}  {rate:.0f} t0/h"
         )
 
     writer.flush()
@@ -470,7 +472,7 @@ def main() -> None:
     }
     with open(os.path.join(out_dir, f"_meta-w{args.worker_id:02d}.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    log(f"완료: t0={n_ok} 통과샘플={n_pass} 실패={n_fail}")
+    log(f"done: t0={n_ok} passed={n_pass} failed={n_fail}")
 
 
 if __name__ == "__main__":

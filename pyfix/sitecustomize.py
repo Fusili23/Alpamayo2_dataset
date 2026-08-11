@@ -1,18 +1,18 @@
-"""AISL-GPU4 네트워크 우회 (huggingface.co CloudFront 엣지 장애).
+"""Network workaround for huggingface.co CloudFront edge failures.
 
-이 노드에서 `huggingface.co`가 해석되는 CloudFront 엣지(icn57, 서울)는
-SYN에 응답하지 않는 경우가 잦다. 관측상 4개 A 레코드가 전부 죽는 구간도
-있었다. 반면 `cdn-lfs.hf.co` 등 다른 HF CloudFront 배포의 엣지는 정상이며,
-CloudFront 엣지는 SNI로 배포를 라우팅하므로 huggingface.co 요청을 그
-엣지로 보내도 200이 돌아온다 (인증서도 SNI 기준이라 검증 통과).
+On this node the CloudFront edges that `huggingface.co` resolves to often fail
+to answer SYN. At times all four A records were dead. Other HF CloudFront
+distributions such as `cdn-lfs.hf.co` stay healthy, and CloudFront edges route
+by SNI, so sending a huggingface.co request to one of those edges returns 200
+(the certificate is also selected by SNI, so validation passes).
 
-동작:
-  1. 대상 호스트의 A 레코드를 짧은 TCP 프로브로 걸러 살아있는 것만 쓴다.
-  2. 전부 죽었으면, 살아있는 다른 HF CloudFront 엣지로 대체한다.
-  3. 결과는 프로세스 + 디스크에 캐시한다 (TTL).
+Behavior:
+  1. Probe the target host's A records over TCP and keep only the live ones.
+  2. If all are dead, borrow a live edge from another HF CloudFront distribution.
+  3. Cache the result in process and on disk with a TTL.
 
-IP를 하드코딩하지 않으므로 엣지가 교체돼도 유효하다.
-비활성화: NET_FIX=0
+No IP is hardcoded, so this keeps working when edges are replaced.
+Disable with NET_FIX=0
 """
 
 import json
@@ -26,9 +26,9 @@ if os.environ.get("NET_FIX", "1") != "0":
     _CACHE_TTL = float(os.environ.get("NET_CACHE_TTL", "900"))
     _CACHE_PATH = os.environ.get("NET_CACHE_PATH", "/NHNHOME/hf-cache/.alive_edges.json")
 
-    # 고쳐야 하는 호스트 (HF API/웹)
+    # hosts that need fixing (HF API and web)
     _TARGET_HOSTS = {"huggingface.co", "www.huggingface.co"}
-    # 엣지를 빌려올 수 있는, 같은 CloudFront 위의 HF 호스트들
+    # HF hosts on the same CloudFront we can borrow an edge from
     _DONOR_HOSTS = (
         "cdn-lfs.hf.co",
         "cdn-lfs-us-1.hf.co",
@@ -90,7 +90,7 @@ if os.environ.get("NET_FIX", "1") != "0":
         alive = [ip for ip in _ipv4_of(host, port) if _probe(ip, port, socket.AF_INET)]
         if alive:
             return alive
-        # 자기 엣지가 전부 죽음 -> 다른 HF CloudFront 배포의 엣지를 빌린다
+        # all own edges are dead, borrow one from another HF distribution
         for donor in _DONOR_HOSTS:
             borrowed = [ip for ip in _ipv4_of(donor, port) if _probe(ip, port, socket.AF_INET)]
             if borrowed:
@@ -111,7 +111,7 @@ if os.environ.get("NET_FIX", "1") != "0":
         if alive is None:
             alive = _disk.get(key)
             if alive is not None and not _probe(alive[0], port, socket.AF_INET):
-                alive = None  # 캐시가 상했다
+                alive = None  # stale cache
         if alive is None:
             alive = _find_alive(host, port)
             if alive:

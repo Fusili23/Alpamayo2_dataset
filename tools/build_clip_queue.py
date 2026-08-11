@@ -1,12 +1,12 @@
-"""생성 작업 큐를 가치 순으로 만든다.
+"""Build the generation work queue ordered by value.
 
-서버 접근이 언제 끊길지 모르므로 순서가 중요하다. 앞쪽부터 처리되니
-가장 값어치 있는 클립을 앞에 둔다:
+Server access can end at any time, so ordering matters. The queue is consumed
+from the front, so the most valuable clips go first:
 
-  1. vla_golden (1,181) — 큐레이트된 고품질 셋, 논문 평가에 쓰인 것
-  2. clip_index의 나머지 유효 클립 — split 기준으로 train 먼저
+  1. vla_golden (1,181): the curated high quality set used for paper evaluation
+  2. remaining valid clips from clip_index, train split first
 
-셔플은 고정 seed로 한다. 중간에 끊겨도 남은 부분의 분포가 치우치지 않는다.
+Shuffling uses a fixed seed so an interrupted run still leaves an unbiased remainder.
 """
 
 import argparse
@@ -43,11 +43,11 @@ def main() -> None:
     if "clip_is_valid" in idx.columns:
         before = len(idx)
         idx = idx[idx["clip_is_valid"].astype(bool)]
-        print(f"clip_is_valid 필터: {before} -> {len(idx)}")
+        print(f"clip_is_valid filter: {before} -> {len(idx)}")
 
-    # train split을 앞에, 나머지를 뒤에. split이 없으면 순서 유지
+    # train split first, the rest after. Preserve order when split is absent
     if "split" in idx.columns:
-        print("split 분포:", idx["split"].value_counts().to_dict())
+        print("split distribution:", idx["split"].value_counts().to_dict())
         order = {"train": 0, "val": 1, "validation": 1, "test": 2}
         idx["_o"] = idx["split"].map(lambda s: order.get(str(s).lower(), 3))
     else:
@@ -61,10 +61,10 @@ def main() -> None:
     out["priority"] = ["golden"] * len(golden) + ["extended"] * len(rest_ids)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     out.to_parquet(args.out, index=False)
-    print(f"\n큐 저장: {args.out}")
+    print(f"\nqueue saved: {args.out}")
     print(f"  golden   {len(golden):>7,}")
     print(f"  extended {len(rest_ids):>7,}")
-    print(f"  합계     {len(queue):>7,}  (약 {len(queue)*26/1000:.0f} GB 전부 처리 시)")
+    print(f"  total     {len(queue):>7,}  (about {len(queue)*26/1000:.0f} GB if fully processed)")
 
 
 if __name__ == "__main__":

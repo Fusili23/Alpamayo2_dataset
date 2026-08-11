@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Alpamayo 34B CoC 데이터셋 생성 — 시작 / 중단 / 상태
+# Alpamayo 34B CoC dataset generation: start / stop / status
 #
-# GPU를 다른 사람이 써야 할 수 있으므로 언제든 안전하게 멈출 수 있다.
-#   ./run.sh stop    -> SIGTERM. 각 워커가 shard를 flush하고 종료한다.
-#   ./run.sh start   -> 남은 (clip_id, t0_us)부터 이어서 진행한다.
-# 강제 종료(kill -9)로 죽어도 마지막 flush 이후 분량만 잃고 재개된다.
+# Someone else may need the GPUs, so this can be stopped safely at any time.
+#   ./run.sh stop    sends SIGTERM. Each worker flushes its shards and exits.
+#   ./run.sh start   resumes from the remaining (clip_id, t0_us) keys.
+# Even after kill -9, only work since the last flush is lost and it resumes.
 
 set -euo pipefail
 
@@ -13,25 +13,25 @@ source "$BIG/env.sh"
 
 OUT=${OUT:-$BIG/data/coc_34b_v1}
 QUEUE=${QUEUE:-$BIG/data/clip_queue.parquet}
-WORKERS_PER_GPU=${WORKERS_PER_GPU:-2}   # 34B는 69GB -> GPU(183GB)당 2개
+WORKERS_PER_GPU=${WORKERS_PER_GPU:-2}   # the 34B is 69GB, so 2 per GPU (183GB)
 NUM_GPUS=${NUM_GPUS:-4}
 NUM_WORKERS=$((WORKERS_PER_GPU * NUM_GPUS))
 VENV=/NHNHOME/venvs/alpamayo2
 PATTERN="generate_coc_34b.py"
 
-# uv run 래퍼가 아니라 실제 python 프로세스만 센다 (래퍼까지 세면 2배로 보인다)
+# count only real python processes, not the uv run wrappers (which would double it)
 worker_pids() { pgrep -f "^$VENV/bin/python3 -u $BIG/tools/$PATTERN" 2>/dev/null || true; }
 
 case "${1:-status}" in
 
 start)
   if [ -n "$(worker_pids)" ]; then
-    echo "이미 실행 중입니다. 먼저 './run.sh stop'"; exit 1
+    echo "Already running. Run './run.sh stop' first."; exit 1
   fi
-  [ -f "$QUEUE" ] || { echo "클립 큐가 없습니다: $QUEUE"; echo "먼저: ./run.sh queue"; exit 1; }
+  [ -f "$QUEUE" ] || { echo "No clip queue at: $QUEUE"; echo "Run ./run.sh queue first"; exit 1; }
   mkdir -p "$OUT" "$BIG/logs"
   cd "$BIG/alpamayo2"
-  echo "워커 $NUM_WORKERS개 시작 (GPU당 $WORKERS_PER_GPU개)"
+  echo "starting $NUM_WORKERS workers ($WORKERS_PER_GPU per GPU)"
   for w in $(seq 0 $((NUM_WORKERS - 1))); do
     UV_PROJECT_ENVIRONMENT=$VENV nohup uv run python -u "$BIG/tools/generate_coc_34b.py" \
       --out "$OUT" --clips-file "$QUEUE" \
@@ -39,13 +39,13 @@ start)
       > "$BIG/logs/gen34_w$w.log" 2>&1 &
     sleep 0.3
   done
-  echo "시작됨. 상태: ./run.sh status"
+  echo "started. status: ./run.sh status"
   ;;
 
 stop)
   pids=$(worker_pids)
-  if [ -z "$pids" ]; then echo "실행 중인 워커가 없습니다."; exit 0; fi
-  echo "SIGTERM 전송 — 각 워커가 shard flush 후 종료합니다..."
+  if [ -z "$pids" ]; then echo "No workers running."; exit 0; fi
+  echo "sending SIGTERM, each worker flushes shards then exits..."
   # shellcheck disable=SC2086
   kill -TERM $pids 2>/dev/null || true
   for _ in $(seq 1 60); do
@@ -53,25 +53,25 @@ stop)
     sleep 1
   done
   if [ -n "$(worker_pids)" ]; then
-    echo "60초 내 미종료 — SIGKILL (마지막 flush 이후 분량만 손실, 재개 가능)"
+    echo "still alive after 60s, sending SIGKILL (only work since last flush is lost)"
     # shellcheck disable=SC2086
     kill -9 $(worker_pids) 2>/dev/null || true
   fi
-  echo "정지 완료. GPU 반납됨:"
+  echo "stopped. GPUs released:"
   nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
   ;;
 
 status)
   n=$(worker_pids | wc -w)
-  echo "실행 중인 워커: $n"
+  echo "running workers: $n"
   if [ -d "$OUT/samples" ]; then
     t0=$(ls "$OUT"/frames/*.parquet 2>/dev/null | wc -l)
-    echo "frames shard: $t0   총 용량: $(du -sh "$OUT" 2>/dev/null | cut -f1)"
+    echo "frames shard: $t0   total size: $(du -sh "$OUT" 2>/dev/null | cut -f1)"
   fi
-  echo "--- 워커별 마지막 진행 ---"
+  echo "--- last progress per worker ---"
   for f in "$BIG"/logs/gen34_w*.log; do
     [ -f "$f" ] || continue
-    printf "%s: %s\n" "$(basename "$f" .log)" "$(grep '누적 t0' "$f" 2>/dev/null | tail -1 | cut -c1-110)"
+    printf "%s: %s\n" "$(basename "$f" .log)" "$(grep 'cum t0' "$f" 2>/dev/null | tail -1 | cut -c1-110)"
   done
   echo "--- GPU ---"
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
@@ -83,6 +83,6 @@ queue)
   ;;
 
 *)
-  echo "사용법: $0 {start|stop|status|queue}"; exit 1
+  echo "usage: $0 {start|stop|status|queue}"; exit 1
   ;;
 esac

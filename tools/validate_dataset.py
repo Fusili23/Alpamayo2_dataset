@@ -1,14 +1,14 @@
-"""데이터셋 무결성 검사. 생성과 병행할 수 있도록 CPU만 쓴다.
+"""Dataset integrity check. CPU only, so it can run alongside generation.
 
-생성 중에도 돌릴 수 있게 설계했다. 다만 마지막 shard는 아직 쓰이는 중일 수 있으므로
-읽기 실패를 곧바로 "깨짐"으로 보지 않고 별도로 표시한다.
+Safe to run during generation. The last shard may still be open for writing,
+so a read failure there is reported as a warning rather than corruption.
 
-검사 항목:
-  구조   — 평탄화된 배열 길이가 스키마 주석과 맞는가
-  값     — NaN / 빈 문자열 / 음수 토큰 수
-  이미지 — JPEG가 실제로 디코드되는가, 장수·해상도가 맞는가 (표본 검사)
-  정합성 — samples 와 frames 의 (clip_id, t0_us) 집합이 일치하는가
-  중복   — (clip_id, t0_us, sample_idx) 가 유일한가
+Checks:
+  structure   flattened array lengths match the schema comments
+  values      NaN, empty strings, negative token counts
+  images      JPEGs actually decode, count and resolution match (sampled)
+  consistency (clip_id, t0_us) sets agree between samples and frames
+  duplicates  (clip_id, t0_us, sample_idx) is unique
 """
 
 import argparse
@@ -23,7 +23,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image
 
-# (컬럼, 기대 길이) — 평탄화 전 형상은 주석 참고
+# (column, expected length); see comments for the pre-flatten shape
 SAMPLE_LENGTHS = [
     ("pred_xyz", 64 * 3),
     ("pred_rot", 64 * 9),
@@ -42,7 +42,7 @@ def main() -> None:
     big = os.environ.get("BIG", "/NHNHOME/WORKSPACE/0526050025_A/alpamayo")
     p = argparse.ArgumentParser()
     p.add_argument("--data", default=f"{big}/data/coc_34b_v1")
-    p.add_argument("--jpeg-samples", type=int, default=2, help="shard당 디코드 검사할 프레임 행 수")
+    p.add_argument("--jpeg-samples", type=int, default=2, help="frame rows per shard to decode check")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
     random.seed(args.seed)
@@ -54,7 +54,7 @@ def main() -> None:
     s_files = sorted(
         f for f in os.listdir(os.path.join(args.data, "samples")) if f.endswith(".parquet")
     )
-    log(f"samples shard {len(s_files)}개 검사 시작")
+    log(f"samples checking {len(s_files)} shards")
     s_keys: set = set()
     dup = Counter()
     n_rows = 0
@@ -65,9 +65,9 @@ def main() -> None:
         try:
             t = pq.read_table(path)
         except Exception as e:
-            # 마지막 shard는 쓰이는 중일 수 있다
+            # the last shard may still be being written
             (warn if fn == s_files[-1] else problems).append(
-                f"samples/{fn} 읽기 실패: {type(e).__name__} {str(e)[:80]}"
+                f"samples/{fn} read failed: {type(e).__name__} {str(e)[:80]}"
             )
             continue
         d = t.to_pandas()
@@ -77,23 +77,23 @@ def main() -> None:
             bad = (d[col].apply(len) != exp).sum()
             if bad:
                 bad_len += bad
-                problems.append(f"samples/{fn}: {col} 길이 불일치 {bad}행 (기대 {exp})")
+                problems.append(f"samples/{fn}: {col} length mismatch in {bad} rows (expected {exp})")
 
         b = (d.topk_ids.apply(len) != d.num_gen_tokens * d.topk_k).sum()
         b += (d.topk_logprobs.apply(len) != d.num_gen_tokens * d.topk_k).sum()
         if b:
             bad_topk += b
-            problems.append(f"samples/{fn}: topk 길이 불일치 {b}행")
+            problems.append(f"samples/{fn}: topk length mismatch in {b} rows")
 
         nan = int(d.ade.isna().sum() + d.seq_logprob.isna().sum() + d.min_ade_at_t0.isna().sum())
         if nan:
             bad_nan += nan
-            problems.append(f"samples/{fn}: NaN {nan}개")
+            problems.append(f"samples/{fn}: {nan} NaN values")
 
         empty = int((d.coc.fillna("").str.strip() == "").sum())
         if empty:
             bad_coc += empty
-            problems.append(f"samples/{fn}: 빈 CoC {empty}행")
+            problems.append(f"samples/{fn}: {empty} rows with empty CoC")
 
         for k in zip(d.clip_id, d.t0_us, d.sample_idx):
             dup[k] += 1
@@ -104,13 +104,13 @@ def main() -> None:
 
     n_dup = sum(v - 1 for v in dup.values() if v > 1)
     if n_dup:
-        problems.append(f"samples: 중복 (clip,t0,sample_idx) {n_dup}건")
+        problems.append(f"samples: {n_dup} duplicate (clip,t0,sample_idx) keys")
 
     # ---------- frames ----------
     f_files = sorted(
         f for f in os.listdir(os.path.join(args.data, "frames")) if f.endswith(".parquet")
     )
-    log(f"frames shard {len(f_files)}개 검사 시작")
+    log(f"checking {len(f_files)} frames shards")
     f_keys: set = set()
     bad_cnt = bad_cam = bad_jpeg = 0
     n_frames = 0
@@ -121,7 +121,7 @@ def main() -> None:
             t = pq.read_table(path)
         except Exception as e:
             (warn if fn == f_files[-1] else problems).append(
-                f"frames/{fn} 읽기 실패: {type(e).__name__} {str(e)[:80]}"
+                f"frames/{fn} read failed: {type(e).__name__} {str(e)[:80]}"
             )
             continue
         d = t.to_pandas()
@@ -131,14 +131,14 @@ def main() -> None:
         b = int((d.jpegs.apply(len) != exp_imgs).sum())
         if b:
             bad_cnt += b
-            problems.append(f"frames/{fn}: JPEG 장수 불일치 {b}행")
+            problems.append(f"frames/{fn}: JPEG count mismatch in {b} rows")
 
         b = int((d.camera_indices.apply(lambda x: list(x) != [0, 1, 2, 3, 4, 5, 6])).sum())
         if b:
             bad_cam += b
-            problems.append(f"frames/{fn}: camera_indices 가 canonical 7-ring 이 아님 {b}행")
+            problems.append(f"frames/{fn}: camera_indices is not the canonical 7-ring in {b} rows")
 
-        # JPEG 실제 디코드 (표본)
+        # actually decode JPEGs (sampled)
         for ridx in random.sample(range(len(d)), min(args.jpeg_samples, len(d))):
             r = d.iloc[ridx]
             for j, blob in enumerate(r.jpegs):
@@ -148,56 +148,56 @@ def main() -> None:
                     if (im.width, im.height) != (int(r.width), int(r.height)):
                         bad_jpeg += 1
                         problems.append(
-                            f"frames/{fn} 행{ridx} 이미지{j}: 해상도 {im.size} != "
+                            f"frames/{fn} row {ridx} image {j}: resolution {im.size} != "
                             f"({r.width},{r.height})"
                         )
                 except Exception as e:
                     bad_jpeg += 1
                     problems.append(
-                        f"frames/{fn} 행{ridx} 이미지{j}: 디코드 실패 {type(e).__name__}"
+                        f"frames/{fn} row {ridx} image {j}: decode failed {type(e).__name__}"
                     )
 
         f_keys.update(zip(d.clip_id, d.t0_us))
         if (i + 1) % 200 == 0:
             log(f"  frames {i+1}/{len(f_files)} ...")
 
-    # ---------- 정합성 ----------
+    # ---------- consistency ----------
     only_s = s_keys - f_keys
     only_f = f_keys - s_keys
     if only_s:
-        problems.append(f"samples 에만 있는 (clip,t0): {len(only_s)}건 — 프레임 없음")
+        problems.append(f"{len(only_s)} (clip,t0) keys only in samples: no frames")
     if only_f:
-        warn.append(f"frames 에만 있는 (clip,t0): {len(only_f)}건 — 샘플 없음(생성 중이면 정상)")
+        warn.append(f"{len(only_f)} (clip,t0) keys only in frames: no samples (normal during generation)")
 
-    # ---------- 보고 ----------
+    # ---------- report ----------
     print("\n" + "=" * 62)
-    print("데이터셋 무결성 검사 결과")
+    print("Dataset integrity check results")
     print("=" * 62)
-    print(f"  samples : {n_rows:,}행 / {len(s_files)} shard")
-    print(f"  frames  : {n_frames:,}행 / {len(f_files)} shard")
-    print(f"  고유 t0 : {len(s_keys):,}")
+    print(f"  samples : {n_rows:,} rows / {len(s_files)} shards")
+    print(f"  frames  : {n_frames:,} rows / {len(f_files)} shards")
+    print(f"  unique t0: {len(s_keys):,}")
     print()
-    print(f"  배열 길이 불일치 : {bad_len}")
-    print(f"  topk 길이 불일치 : {bad_topk}")
+    print(f"  array length mismatch : {bad_len}")
+    print(f"  topk length mismatch : {bad_topk}")
     print(f"  NaN              : {bad_nan}")
-    print(f"  빈 CoC           : {bad_coc}")
-    print(f"  중복 키          : {n_dup}")
-    print(f"  JPEG 장수 불일치 : {bad_cnt}")
-    print(f"  카메라 구성 오류 : {bad_cam}")
-    print(f"  JPEG 디코드 실패 : {bad_jpeg}")
+    print(f"  empty CoC           : {bad_coc}")
+    print(f"  duplicate keys      : {n_dup}")
+    print(f"  JPEG count mismatch : {bad_cnt}")
+    print(f"  camera config error : {bad_cam}")
+    print(f"  JPEG decode failed  : {bad_jpeg}")
     print()
     if warn:
-        print(f"  경고 {len(warn)}건 (생성 중이면 정상):")
+        print(f"  {len(warn)} warnings (normal during generation):")
         for w in warn[:10]:
             print(f"    - {w}")
     if problems:
-        print(f"\n  !! 문제 {len(problems)}건:")
+        print(f"\n  !! {len(problems)} problems:")
         for pr in problems[:40]:
             print(f"    - {pr}")
         if len(problems) > 40:
-            print(f"    ... 외 {len(problems)-40}건")
+            print(f"    ... and {len(problems)-40} more")
         sys.exit(1)
-    print("\n  문제 없음. 데이터셋 정상.")
+    print("\n  No problems found. Dataset is healthy.")
 
 
 if __name__ == "__main__":

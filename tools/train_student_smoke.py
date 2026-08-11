@@ -1,14 +1,17 @@
-"""Alpamayo 2 규격 데이터셋으로 소형 student를 학습해 loss 하강을 확인한다.
+"""Train a small student on the Alpamayo 2 format dataset and confirm loss decreases.
 
-목적은 성능이 아니라 **포맷 검증**이다. 34B teacher가 사라진 뒤에는 데이터를 다시 만들
-수 없으므로, 지금 이 데이터가 실제 학습 경로에 물리는지 확인해야 한다.
+The goal is format validation, not performance. Once the 34B teacher is gone the
+dataset cannot be regenerated, so we must confirm now that it fits a real
+training path.
 
-NVlabs/alpamayo-recipes 의 SFT 레시피는 Alpamayo 1.5 전용이라(chat template r1/r1_5,
-QwenProcessor, 공개 OOD 라벨 사용) 그대로 못 쓴다. 대신 alpamayo2_super 라이브러리를
-직접 쓰는 최소 루프로 검증한다 — 생성 파이프라인에서 이미 검증된 경로다.
+The SFT recipe in NVlabs/alpamayo-recipes targets Alpamayo 1.5 (chat template
+r1/r1_5, QwenProcessor, published OOD labels) and cannot be used as is. Instead
+this uses a minimal loop over the alpamayo2_super library directly, which is the
+same path already validated by the generation pipeline.
 
-학습 forward 는 diffusion expert 를 쓰지 않는다. 궤적이 이산 토큰으로 융합되어
-텍스트와 함께 next-token loss 로 학습된다(recipes README 의 Stage 1).
+The training forward pass does not use the diffusion expert. Trajectories are
+fused as discrete tokens and learned with next token loss alongside the text
+(Stage 1 in the recipes README).
 """
 
 import argparse
@@ -33,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     big = os.environ.get("BIG", "/NHNHOME/WORKSPACE/0526050025_A/alpamayo")
     p = argparse.ArgumentParser()
     p.add_argument("--data", default=f"{big}/data/coc_34b_v1")
-    p.add_argument("--teacher", default="nvidia/Alpamayo2-Super", help="config/토크나이저 출처")
+    p.add_argument("--teacher", default="nvidia/Alpamayo2-Super", help="source of config and tokenizer")
     p.add_argument("--backbone", default="Qwen/Qwen3-VL-2B-Instruct")
     p.add_argument("--gpu", type=int, default=3)
     p.add_argument("--steps", type=int, default=60)
@@ -50,7 +53,7 @@ def log(m: str) -> None:
 
 
 def load_pairs(data_dir: str, limit: int) -> list:
-    """samples 와 frames 를 (clip_id, t0_us) 로 조인해 학습 표본을 만든다."""
+    """Join samples and frames on (clip_id, t0_us) to build training examples."""
     fr = {}
     need = limit
     for fn in sorted(glob.glob(f"{data_dir}/frames/*.parquet")):
@@ -59,13 +62,13 @@ def load_pairs(data_dir: str, limit: int) -> list:
             fr[(r.clip_id, r.t0_us)] = r
         if len(fr) >= need:
             break
-    log(f"frames {len(fr)}개 로드")
+    log(f"frames {len(fr)} loaded")
 
     out = []
     seen = set()
     for fn in sorted(glob.glob(f"{data_dir}/samples/*.parquet")):
         t = pq.read_table(fn).to_pandas()
-        # t0 당 최선 샘플 하나만 (ADE 최소) — 검증에는 이걸로 충분하다
+        # one best sample per t0 (lowest ADE); enough for validation
         t = t.sort_values("ade").drop_duplicates(["clip_id", "t0_us"], keep="first")
         for _, s in t.iterrows():
             k = (s.clip_id, s.t0_us)
@@ -79,7 +82,7 @@ def load_pairs(data_dir: str, limit: int) -> list:
 
 
 def build_source_data(s, f, canonical_names, canonical_ids) -> dict:
-    """저장된 JPEG 와 궤적으로 load_physical_aiavdataset() 의 반환 계약을 재현한다."""
+    """Rebuild the load_physical_aiavdataset() return contract from stored JPEGs and trajectories."""
     imgs = [
         torch.from_numpy(np.array(Image.open(io.BytesIO(b)).convert("RGB"))).permute(2, 0, 1)
         for b in f.jpegs
@@ -113,7 +116,7 @@ def build_source_data(s, f, canonical_names, canonical_ids) -> dict:
         "ego_history_rot": hr[None, None],
         "ego_future_xyz": fx[None, None],
         "ego_future_rot": frot[None, None],
-        # t0 기준 로컬 프레임이므로 원점·단위 회전
+        # local frame at t0, so origin and identity rotation
         "ego_t0_xyz": torch.zeros(1, 1, 3),
         "ego_t0_inv_quat": torch.tensor([1.0, 0.0, 0.0, 0.0]).view(1, 1, 4),
         "t0_us": t0,
@@ -122,15 +125,16 @@ def build_source_data(s, f, canonical_names, canonical_ids) -> dict:
 
 
 def prepare_training_inputs(data, coc_text, model, helper, build_conversation):
-    """학습용 토큰화. helper.prepare_model_inputs 는 generation_mode=True 라 쓸 수 없다.
+    """Tokenize for training. helper.prepare_model_inputs hardcodes generation_mode=True.
 
-    추론 모드는 "생성할 대상"을 시퀀스에서 뺀다. 그래서 future 궤적 자리표시자가 0개가
-    되고 fuse_traj_tokens 가 128개를 넣지 못해 실패한다.
-    학습에는 CoC 텍스트와 궤적 자리표시자가 **시퀀스 안에** 있어야 loss 를 걸 수 있다.
+    Generation mode removes the target from the sequence, leaving zero future
+    trajectory placeholders, so fuse_traj_tokens fails trying to insert 128.
+    Training needs the CoC text and trajectory placeholders inside the sequence
+    so a loss can be computed on them.
     """
     cfg = model.config
     data = dict(data)
-    data["cot"] = coc_text  # assistant 응답으로 들어갈 목표 텍스트
+    data["cot"] = coc_text  # target text that becomes the assistant response
 
     messages = build_conversation(
         data=data,
@@ -138,7 +142,7 @@ def prepare_training_inputs(data, coc_text, model, helper, build_conversation):
         num_tokens_per_future_traj=cfg.tokens_per_future_traj,
         components_order=["image", "traj_history", "prompt", "cot", "traj_future"],
         components_prompt=["cot", "traj_future"],
-        generation_mode=False,  # <- 학습: 목표가 시퀀스에 포함된다
+        generation_mode=False,  # training: the target is part of the sequence
         include_camera_ids=cfg.include_camera_ids,
         camera_ids=data["camera_indices"],
         include_frame_nums=cfg.frame_label == "frame_num",
@@ -171,10 +175,10 @@ def main() -> None:
     names = list(CAMERA_NAMES_TO_INDICES)
     ids = list(CAMERA_NAMES_TO_INDICES.values())
 
-    # teacher config 를 로드해 "수정"하면 안 된다 — vlm_config 가 이미 34B 로 굳어 있고,
-    # traj_ids 도 34B 토크나이저 기준으로 계산돼 있다.
-    # vlm_name_or_path 만 주고 **처음부터 생성**하면 config 가 알아서
-    # 토크나이저 확장 / traj_ids / vocab 크기를 백본에 맞춰 다시 계산한다.
+    # Do not load and edit the teacher config: vlm_config is already fixed to the 34B
+    # and traj_ids are computed against the 34B tokenizer.
+    # Passing only vlm_name_or_path and constructing from scratch makes the config
+    # recompute tokenizer expansion, traj_ids and vocab size for the new backbone.
     t_cfg = Alpamayo2SuperConfig.from_pretrained(args.teacher)
     cfg = Alpamayo2SuperConfig(
         vlm_name_or_path=args.backbone,
@@ -190,9 +194,9 @@ def main() -> None:
         token_layout=t_cfg.token_layout,
         frame_label=t_cfg.frame_label,
         loss_weights=t_cfg.loss_weights,
-        enable_expert=False,  # 학습 forward 는 expert 를 쓰지 않는다
+        enable_expert=False,  # the training forward does not use the expert
     )
-    log(f"student config: 백본 {args.backbone}, expert 비활성")
+    log(f"student config: backbone {args.backbone}, expert disabled")
     log(
         f"  traj_vocab={cfg.traj_vocab_size} hist_tok={cfg.tokens_per_history_traj} "
         f"fut_tok={cfg.tokens_per_future_traj}"
@@ -200,11 +204,11 @@ def main() -> None:
 
     model = Alpamayo2Super(cfg)
     n_par = sum(p.numel() for p in model.parameters())
-    log(f"모델 생성: {n_par/1e9:.2f}B 파라미터 (랜덤 초기화)")
+    log(f"model built: {n_par/1e9:.2f}B parameters (randomly initialized)")
 
-    # 사전학습 백본을 얹는다. 랜덤 초기화 상태로 loss 가 떨어지는 건
-    # 토큰 분포를 외우는 것만으로도 되므로 검증 가치가 낮다.
-    # vocab 이 궤적 토큰만큼 확장돼 있어 임베딩/lm_head 는 앞부분만 복사한다.
+    # Load the pretrained backbone. Loss falling from random init proves little,
+    # since memorizing the token distribution alone would do it.
+    # The vocab is extended by the trajectory tokens, so embeddings and lm_head
     import transformers
 
     pre = getattr(transformers, cfg.vlm_class).from_pretrained(
@@ -220,24 +224,24 @@ def main() -> None:
             sd_new[k].copy_(v)
             copied += 1
         elif sd_new[k].ndim == v.ndim and sd_new[k].shape[1:] == v.shape[1:]:
-            n = min(sd_new[k].shape[0], v.shape[0])  # 확장된 vocab: 앞부분만
+            n = min(sd_new[k].shape[0], v.shape[0])  # extended vocab: copy the leading rows only
             sd_new[k][:n].copy_(v[:n])
             partial += 1
         else:
             skipped += 1
     model.vlm.load_state_dict(sd_new)
     del pre, sd_pre, sd_new
-    log(f"사전학습 로드: 완전복사 {copied}, 부분복사 {partial}(vocab 확장), 건너뜀 {skipped}")
+    log(f"pretrained load: full copy {copied}, partial copy {partial} (vocab expansion), skipped {skipped}")
 
     model = model.to(dev, dtype=torch.bfloat16)
 
-    # 프로세서는 한 번만 (생성기에서 얻은 교훈: t0마다 만들면 40% 낭비)
+    # build the processor once (lesson from the generator: rebuilding per t0 wastes 40%)
     _cache: dict = {}
     _orig = helper.get_processor
     helper.get_processor = lambda t, c: _cache.setdefault("p", _orig(t, c))
 
     pairs = load_pairs(args.data, args.max_samples)
-    log(f"학습 표본 {len(pairs)}개")
+    log(f"{len(pairs)} training examples")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     model.train()
@@ -277,19 +281,19 @@ def main() -> None:
             recent = np.mean(losses[-args.log_every :])
             log(
                 f"step {step:4d}/{args.steps}  loss {acc:.4f}  "
-                f"최근평균 {recent:.4f}  {(time.time()-t_start)/step:.1f}s/step  "
+                f"recent avg {recent:.4f}  {(time.time()-t_start)/step:.1f}s/step  "
                 f"mem {torch.cuda.max_memory_allocated()/1e9:.0f}GB"
             )
 
     first = float(np.mean(losses[: max(1, len(losses) // 5)]))
     last = float(np.mean(losses[-max(1, len(losses) // 5) :]))
     log("")
-    log(f"=== 결과 ===")
-    log(f"  초기 20% 평균 loss : {first:.4f}")
-    log(f"  마지막 20% 평균    : {last:.4f}")
-    log(f"  감소               : {first-last:+.4f}  ({100*(first-last)/first:+.1f}%)")
-    verdict = "하강 확인 — 데이터 포맷 유효" if last < first * 0.95 else "하강 불충분 — 조사 필요"
-    log(f"  판정: {verdict}")
+    log(f"=== result ===")
+    log(f"  first 20% mean loss : {first:.4f}")
+    log(f"  last 20% mean       : {last:.4f}")
+    log(f"  decrease            : {first-last:+.4f}  ({100*(first-last)/first:+.1f}%)")
+    verdict = "loss decreased; dataset format is valid" if last < first * 0.95 else "insufficient decrease; needs investigation"
+    log(f"  verdict: {verdict}")
 
     with open(args.out, "w") as fp:
         json.dump(
@@ -304,7 +308,7 @@ def main() -> None:
             fp,
             indent=2,
         )
-    log(f"저장: {args.out}")
+    log(f"saved: {args.out}")
 
 
 if __name__ == "__main__":
