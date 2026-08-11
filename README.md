@@ -1,219 +1,219 @@
-# Alpamayo 2 Super CoC 데이터셋 생성 파이프라인
+# Alpamayo 2 Super CoC Dataset Generation Pipeline
 
-NVIDIA Alpamayo 2 Super (34B) teacher 모델로 자율주행 클립에서 Chain-of-Causation 추론 데이터셋을 만드는 코드입니다. 목적은 이 데이터로 Jetson Thor에 올릴 수 있는 소형 student 모델을 증류하는 것입니다.
+Code for building a Chain-of-Causation reasoning dataset from autonomous driving clips using the NVIDIA Alpamayo 2 Super (34B) teacher model. The goal is to distill a small student model that can run on a Jetson Thor in a vehicle.
 
-teacher는 69GB라 차량에 못 싣고 B200에서도 추론에 1.4초가 걸립니다. GPU 서버를 쓸 수 있을 때 teacher 출력을 최대한 뽑아두고, 나중에 작은 장비에서 student를 학습시키는 구조입니다.
+The teacher is 69GB and takes 1.4 seconds per inference even on a B200, so it cannot go in a car. The approach is to extract as much teacher output as possible while GPU server time is available, then train the student later on smaller hardware.
 
-## 무엇을 만드나
+## What gets generated
 
-클립 하나에서 2초 간격으로 시점(t0)을 뽑고, 각 시점마다 teacher에게 6개 샘플을 생성시킵니다. 저장하는 것은 다음과 같습니다.
+For each clip, timestamps (t0) are sampled every 2 seconds. At each t0 the teacher generates 6 samples. The following is stored:
 
-| 테이블 | 행 단위 | 내용 |
-| --- | --- | --- |
-| `frames/` | (clip, t0) | 7카메라 x 4프레임 = JPEG 28장, 타임스탬프 |
-| `samples/` | (clip, t0, sample) | CoC 텍스트, 예측 궤적, GT 궤적, 과거 궤적, 토큰 분포, ADE |
-| `ranges/` | clip | t0가 가능한 시간 구간 (재개 최적화용) |
+| Table | Row unit | Contents |
+| :-- | :-- | :-- |
+| `frames/` | (clip, t0) | 7 cameras x 4 frames = 28 JPEGs, timestamps |
+| `samples/` | (clip, t0, sample) | CoC text, predicted trajectory, GT trajectory, ego history, token distributions, ADE |
+| `ranges/` | clip | Valid t0 interval for the clip (resume optimization) |
 
-용량은 t0당 약 1.15MB이고 그중 98%가 이미지입니다.
+Storage is about 1.15MB per t0, of which 98 percent is imagery.
 
-## 왜 토큰 분포까지 저장하나
+## Why token distributions are stored
 
-teacher가 샘플링한 텍스트만 저장하면 sequence level SFT 데이터가 됩니다. 각 토큰 위치의 상위 20개 확률분포를 함께 저장하면 token level KL 증류가 가능해집니다.
+Storing only the sampled text produces sequence level SFT data. Storing the top 20 probabilities at each token position enables token level KL distillation.
 
-실제로 저장된 값을 보면 teacher가 첫 토큰에서 "Adapt"(42%)와 "Nudge"(37%)를 거의 반반으로 놓고 고민하는 것이 보입니다. 샘플링된 텍스트만 남기면 이 37%는 영영 사라집니다.
+Looking at actual stored values, the teacher weighs "Adapt" (42 percent) against "Nudge" (37 percent) on the very first token. If only the sampled text is kept, that 37 percent is lost forever.
 
-저장 비용은 t0당 24KB로 프레임 대비 2% 수준이고, 34B와 Qwen3-VL student의 텍스트 토크나이저가 완전히 동일(151,669 토큰 전부 일치)해서 이 분포를 그대로 KL 타깃으로 쓸 수 있습니다.
+The cost is 24KB per t0, roughly 2 percent of the frame storage. The text tokenizers of the 34B teacher and Qwen3-VL students are identical (all 151,669 tokens match), so these distributions can be used directly as KL targets.
 
-나중에 추가할 수 없는 항목이라 처음부터 담았습니다. 프레임과 달리 재계산이 아니라 teacher 재실행이 필요합니다.
+This cannot be added later. Unlike frames, which can be recomputed, it would require rerunning the teacher.
 
-## 파일 구성
+## Files
 
-| 파일 | 역할 |
-| --- | --- |
-| `tools/generate_coc_34b.py` | 메인 생성기 |
-| `tools/run.sh` | 시작, 중단, 상태 확인 |
-| `tools/build_clip_queue.py` | 작업 큐 생성 (vla_golden 우선) |
-| `tools/validate_dataset.py` | 무결성 검사 (생성 중에도 실행 가능) |
-| `tools/compact_dataset.py` | 중복 제거 및 shard 정리 |
-| `tools/bench_cameras.py` | 카메라 수별 추론 지연 측정 |
-| `tools/train_student_smoke.py` | student 학습 검증 |
-| `tools/generate_coc_10b_legacy.py` | Alpamayo 1.5 (10B) 버전, 참고용 |
-| `pyfix/sitecustomize.py` | huggingface.co 접속 장애 우회 |
+| File | Purpose |
+| :-- | :-- |
+| `tools/generate_coc_34b.py` | Main generator |
+| `tools/run.sh` | Start, stop, status |
+| `tools/build_clip_queue.py` | Build work queue (vla_golden first) |
+| `tools/validate_dataset.py` | Integrity check (safe to run during generation) |
+| `tools/compact_dataset.py` | Deduplicate and compact shards |
+| `tools/bench_cameras.py` | Measure inference latency by camera count |
+| `tools/train_student_smoke.py` | Student training validation |
+| `tools/generate_coc_10b_legacy.py` | Alpamayo 1.5 (10B) version, kept for reference |
+| `pyfix/sitecustomize.py` | Workaround for huggingface.co connectivity failures |
 
-## 사용법
+## Usage
 
-환경 변수를 먼저 설정합니다. `env.sh.example`을 복사해 HF 토큰을 채우고 `env.sh`로 저장하세요.
+Set up environment variables first. Copy `env.sh.example`, fill in your HF token, and save it as `env.sh`.
 
 ```bash
 source /path/to/alpamayo/env.sh
 
-./tools/run.sh queue     # 클립 큐 생성 (최초 1회)
-./tools/run.sh start     # 생성 시작
-./tools/run.sh status    # 진행 상황
-./tools/run.sh stop      # 중단, GPU 반납
+./tools/run.sh queue     # build clip queue (once)
+./tools/run.sh start     # start generation
+./tools/run.sh status    # progress
+./tools/run.sh stop      # stop and release GPUs
 ```
 
-`stop`은 언제 눌러도 안전합니다. 각 워커가 메모리에 있던 데이터를 저장하고 종료하며, `start`하면 남은 지점부터 이어갑니다. 강제 종료된 경우에도 마지막 자동 저장(5분 주기) 이후 분량만 잃습니다.
+`stop` is safe at any time. Each worker flushes its in memory rows before exiting, and `start` resumes from where it left off. Even after a hard kill, only work since the last periodic flush (every 5 minutes) is lost.
 
-GPU를 일부만 쓰려면 환경 변수로 조절합니다.
+To use a subset of GPUs:
 
 ```bash
-NUM_GPUS=3 ./tools/run.sh start          # GPU 3장만
-WORKERS_PER_GPU=1 ./tools/run.sh start   # GPU당 워커 1개
+NUM_GPUS=3 ./tools/run.sh start          # only 3 GPUs
+WORKERS_PER_GPU=1 ./tools/run.sh start   # one worker per GPU
 ```
 
-## 설계 결정과 근거
+## Design decisions and evidence
 
-전부 실측으로 정한 값입니다. 추측으로 정한 것은 없습니다.
+Every value below came from measurement. Nothing was chosen by guesswork.
 
-### 카메라 7대를 전부 저장한다
+### Store all 7 cameras
 
-trajectory 태스크는 카메라 (0,1,2,3,5,6)을 쓰고 vqa는 (0,1,2,3,4,5)를 씁니다. 합집합이 7대입니다. 추론에는 태스크가 요구하는 부분집합만 들어가지만 저장은 전부 합니다.
+The trajectory task uses cameras (0,1,2,3,5,6) and vqa uses (0,1,2,3,4,5). The union is all 7. Inference receives only the subset a task requires, but everything is stored.
 
-학습할 때 카메라를 빼는 것은 언제든 가능하지만 없는 것을 나중에 추가할 수는 없습니다. 실제로 이 프로젝트에서 처음에 4카메라로 만든 데이터를 통째로 버린 적이 있습니다. 10B는 4대를 쓰는데 34B는 6대를 써서 호환되지 않았습니다.
+Dropping cameras at training time is always possible; adding cameras that were never stored is not. This project actually discarded an entire dataset over this. The first version was built with the 10B model, which uses 4 cameras, and it was incompatible with the 34B, which uses 6.
 
-7대와 6대의 저장 비용 차이는 3GB 정도입니다.
+The storage difference between 7 and 6 cameras is about 3GB.
 
-### JPEG를 먼저 만들고 그것을 디코드해서 추론한다
+### Encode JPEG first, then decode it for inference
 
-순서가 중요합니다. 원본으로 추론하고 JPEG를 저장하면 저장된 이미지와 저장된 CoC가 서로 다른 입력에서 나온 것이 됩니다.
+Order matters. Running inference on the original frames and then storing a JPEG means the stored image and the stored CoC came from different inputs.
 
-통제 실험 결과입니다.
+Controlled experiment:
 
-| 비교 | CoC 일치 | ADE 최대차 |
-| --- | --- | --- |
-| 원본 vs 원본 (같은 seed 재실행) | 6/6 | 0.0000 |
-| 원본 vs 리사이즈만 | 6/6 | 0.06 |
-| 리사이즈 vs JPEG q92 | 5/6 | 1.14 |
+| Comparison | CoC match | Max ADE difference |
+| :-- | :-- | :-- |
+| original vs original (same seed, rerun) | 6/6 | 0.0000 |
+| original vs resize only | 6/6 | 0.06 |
+| resize vs JPEG q92 | 5/6 | 1.14 |
 
-JPEG 압축만으로 6개 중 1개의 CoC가 뒤집힙니다. 인코딩을 먼저 하면 저장 데이터만으로 비트 단위 재현이 됩니다. 재검증에서 CoC 6/6 일치, ADE 차이 0.0000을 확인했습니다.
+JPEG compression alone flips 1 of 6 CoC outputs. Encoding first makes the dataset bit exact reproducible from stored contents. Reverification showed CoC 6/6 match and ADE difference 0.0000.
 
-### t0 간격은 2초
+### t0 spacing of 2 seconds
 
-logprob 조건을 고정하고 A/B 한 결과입니다.
+A/B test holding the logprob setting constant:
 
-| 간격 | t0/h | clips/h |
-| --- | --- | --- |
-| 1초 | 1,278 | 78 |
-| 2초 | 1,371 | 152 |
+| Spacing | t0/h | clips/h |
+| :-- | :-- | :-- |
+| 1 second | 1,278 | 78 |
+| 2 seconds | 1,371 | 152 |
 
-두 지표 모두 2초가 우세합니다. 처음에는 1초가 나아 보였는데 그 비교에 logprob 유무가 섞여 있었습니다.
+2 seconds wins on both metrics. An earlier comparison appeared to favor 1 second, but that comparison had logprob capture as a confounded second variable.
 
-### num_traj_samples는 6
+### num_traj_samples of 6
 
-k=12는 GPU 메모리 95GB를 써서 GPU당 워커 2개(183GB)를 초과합니다. 텍스트 다양성은 토큰 분포가 대신 담당하므로 6으로 충분합니다.
+k=12 uses 95GB of GPU memory, which exceeds the budget for 2 workers per GPU (183GB). Text diversity is covered by the token distributions instead, so 6 is sufficient.
 
-### top-k는 20
+### top-k of 20
 
-k를 늘려야 하는지 검토하고 기각했습니다. 38,430 토큰으로 측정한 결과입니다.
+Whether to increase k was investigated and rejected. Measured over 38,430 tokens:
 
-| k | 누적 확률 |
-| --- | --- |
-| 20 | 0.8195 (실측) |
-| 50 | 0.8214 (추정) |
-| 100 | 0.8215 (추정) |
+| k | Cumulative probability |
+| :-- | :-- |
+| 20 | 0.8195 (measured) |
+| 50 | 0.8214 (extrapolated) |
+| 100 | 0.8215 (extrapolated) |
 
-확률이 1위와 2위에 몰린 뒤 곧바로 평평한 꼬리로 흩어집니다. 21위 이하 15만 개가 나눠 갖는 18%는 토큰당 1e-6 수준이라 k를 늘려도 담기지 않습니다. 재생성 비용 9시간에 이득 0.2%p이므로 하지 않았습니다.
+Probability concentrates in ranks 1 and 2 and then scatters into a flat tail. The 18 percent held by the 150,000 tokens below rank 20 amounts to roughly 1e-6 each, so a larger k cannot capture it. Regenerating would cost 9 GPU hours for a 0.2 percentage point gain.
 
-토큰별로 보면 79%는 top-20으로 99% 이상 담깁니다. 평균을 끌어내리는 20%는 teacher가 실제로 갈피를 못 잡는 분기점입니다.
+Per token, 79 percent of positions have 99 percent or more captured by top 20. The 20 percent that drags the average down are genuine decision branch points where the teacher is uncertain.
 
-## 성능
+## Performance
 
-실측값입니다. 워커 8개, B200 4장 기준입니다.
+Measured with 8 workers across 4 B200 GPUs.
 
-| 항목 | 값 |
-| --- | --- |
-| 처리량 | 약 1,500 t0/h, 168 clips/h |
-| 크기 | 1.147 MB/t0 |
-| 프롬프트 | 4,580 토큰 (6카메라 x 4프레임) |
-| 추론 | 2.8초/t0 (6샘플) |
+| Metric | Value |
+| :-- | :-- |
+| Throughput | about 1,500 t0/h, 168 clips/h |
+| Size | 1.147 MB per t0 |
+| Prompt | 4,580 tokens (6 cameras x 4 frames) |
+| Inference | 2.8 seconds per t0 (6 samples) |
 
-병목은 GPU가 아닙니다. 구간별 계측 결과입니다.
+The GPU is not the bottleneck. Phase timing:
 
-| 구간 | 비중 |
-| --- | --- |
-| tokenize (이미지 전처리 포함) | 19% |
-| decode (영상) | 22% |
-| open (네트워크 스트리밍) | 20% |
-| infer (GPU) | 15% |
-| encode (JPEG) | 6% |
+| Phase | Share |
+| :-- | :-- |
+| tokenize (includes image preprocessing) | 19 percent |
+| decode (video) | 22 percent |
+| open (network streaming) | 20 percent |
+| infer (GPU) | 15 percent |
+| encode (JPEG) | 6 percent |
 
-처음에는 JPEG 인코딩이 병목이라 보고 스레드 병렬화까지 했는데 실제로는 6%였습니다. 계측 결과 tokenize가 39%로 최대 병목이었고, 원인은 `helper.prepare_model_inputs`가 t0마다 `AutoProcessor.from_pretrained`를 호출하는 것이었습니다. 프로세서를 한 번만 만들도록 고쳐서 39%에서 19%로 줄였고 GPU 사용률이 18%에서 62%로 올랐습니다.
+JPEG encoding was initially assumed to be the bottleneck and was parallelized with a thread pool, but measurement showed it was only 6 percent. The real bottleneck was tokenize at 39 percent, caused by `helper.prepare_model_inputs` calling `AutoProcessor.from_pretrained` on every t0. Caching the processor once dropped it from 39 to 19 percent and raised GPU utilization from 18 to 62 percent.
 
-## 카메라 수별 추론 지연
+## Inference latency by camera count
 
-Thor 배포 설계용으로 측정한 값입니다. B200, num_traj_samples=1 기준입니다.
+Measured for Thor deployment planning. B200, num_traj_samples=1.
 
-| 카메라 | 이미지 | 토큰 | 지연 | 속도 향상 |
-| --- | --- | --- | --- | --- |
+| Cameras | Images | Tokens | Latency | Speedup |
+| :-- | :-- | :-- | :-- | :-- |
 | 1 | 4 | 838 | 0.591s | 2.38x |
 | 2 | 8 | 1,585 | 0.913s | 1.54x |
 | 3 | 12 | 2,333 | 1.033s | 1.36x |
 | 4 | 16 | 3,082 | 1.211s | 1.16x |
 | 6 | 24 | 4,580 | 1.408s | 1.00x |
 
-토큰 수는 카메라에 정확히 선형입니다. 이미지 1장당 187토큰입니다.
+Token count is exactly linear in camera count, at 187 tokens per image.
 
-지연은 선형이 아닙니다. 토큰이 5.5배 늘어날 때 지연은 2.4배만 늡니다. 고정 비용(diffusion expert, CoC 디코딩)이 지배해서 이미지 4장짜리 최소 구성에서도 0.59초가 듭니다.
+Latency is not linear. A 5.5x increase in tokens produces only a 2.4x increase in latency. Fixed costs (diffusion expert, CoC decoding) dominate, so even a 4 image configuration takes 0.59 seconds.
 
-함의는 카메라 축소만으로 실시간(10Hz)에 도달할 수 없다는 것입니다. 6대에서 3대로 줄여도 1.36배인데 14배가 필요합니다. 모델 축소가 필수이고 카메라 축소는 보조 수단입니다.
+The implication is that reducing cameras alone cannot reach real time (10Hz). Going from 6 cameras to 3 gives 1.36x when 14x is needed. Model size reduction is mandatory; camera reduction is secondary.
 
-## student 학습 검증
+## Student training validation
 
-teacher가 사라진 뒤에는 데이터를 다시 만들 수 없으므로 포맷이 학습에 물리는지 미리 확인했습니다.
+Once the teacher is gone the dataset cannot be regenerated, so the format was verified against a real training path while server time remained.
 
-Qwen3-VL-2B 백본으로 Alpamayo2Super 구조를 만들어 실제 데이터로 학습시킨 결과입니다.
+An Alpamayo2Super model was constructed with a Qwen3-VL-2B backbone and trained on actual data:
 
 ```
-사전학습 로드: 완전복사 624, 부분복사 2(vocab 확장), 건너뜀 0
+pretrained load: full copy 624, partial copy 2 (vocab expansion), skipped 0
 step  1: loss 38.33
 step  5: loss 26.59
 step 10: loss 21.13
 step 15: loss 19.47
 ```
 
-사전학습 가중치가 하나도 버려지지 않고(건너뜀 0) 들어갔고, loss가 단조 감소합니다.
+No pretrained weights were dropped (skipped 0) and loss decreases monotonically.
 
-학습 경로에서 막혔던 지점 두 가지를 기록해둡니다.
+Two obstacles are worth recording.
 
-첫째, teacher config를 로드해서 백본 이름만 바꾸면 안 됩니다. `vlm_config`가 34B로 굳어 있고 `traj_ids`도 34B 토크나이저 기준으로 계산돼 있습니다. `vlm_name_or_path`만 주고 처음부터 생성하면 config가 토크나이저 확장과 traj_ids를 백본에 맞춰 다시 계산합니다.
+First, the teacher config cannot be loaded and edited to swap the backbone. Its `vlm_config` is already fixed to the 34B and `traj_ids` are computed against the 34B tokenizer. Passing only `vlm_name_or_path` and constructing from scratch makes the config recompute tokenizer expansion and traj_ids for the new backbone.
 
-둘째, `helper.prepare_model_inputs`는 `generation_mode=True`로 하드코딩돼 있어 학습에 쓸 수 없습니다. 추론 모드는 생성할 대상을 시퀀스에서 빼기 때문에 future 궤적 자리표시자가 0개가 되고 `fuse_traj_tokens`가 128개를 넣지 못해 실패합니다. `build_conversation`을 직접 호출해 `generation_mode=False`로 만들어야 합니다.
+Second, `helper.prepare_model_inputs` hardcodes `generation_mode=True` and cannot be used for training. Generation mode removes the target from the sequence, so there are zero future trajectory placeholders and `fuse_traj_tokens` fails trying to insert 128. Training requires calling `build_conversation` directly with `generation_mode=False`.
 
-학습 forward는 diffusion expert를 쓰지 않습니다. 궤적이 이산 토큰으로 융합되어 텍스트와 함께 next token loss로 학습됩니다. expert는 추론 시 그 토큰을 연속 궤적으로 정제하는 역할입니다.
+The training forward pass does not use the diffusion expert. Trajectories are fused as discrete tokens and learned with next token loss alongside the text. The expert refines those tokens into continuous trajectories at inference time.
 
-## 운영 중 알아야 할 것
+## Operational notes
 
-### 네트워크 우회가 필요합니다
+### Network workaround is required
 
-이 노드에서는 `huggingface.co`가 자주 죽습니다. CloudFront anycast라 IP가 여러 개인데 그중 다수가 SYN에 응답하지 않습니다. 파이썬 기본 연결 타임아웃이 무한이라 죽은 IP를 뽑으면 오류 없이 영원히 멈춥니다.
+On this node `huggingface.co` frequently fails. It resolves through CloudFront anycast to several IPs, many of which silently drop SYN packets. Python's default connect timeout is unlimited, so hitting a dead IP hangs forever with no error.
 
-`pyfix/sitecustomize.py`가 `PYTHONPATH`를 통해 자동 적용됩니다. 원리는 CloudFront 엣지가 SNI로 배포를 고르므로, 살아있는 다른 HF 엣지(`cdn-lfs.hf.co` 등)에 `huggingface.co`라는 SNI로 붙는 것입니다. IP를 하드코딩하지 않아 엣지가 바뀌어도 동작합니다.
+`pyfix/sitecustomize.py` is applied automatically through `PYTHONPATH`. It works because CloudFront edges route by SNI, so connecting to a live HF edge (such as `cdn-lfs.hf.co`) while presenting `huggingface.co` as SNI returns a valid response. No IP is hardcoded, so it keeps working when edges change.
 
-증상 확인은 `ss -tnp | grep <PID>`로 `SYN-SENT`가 보이는지 확인하면 됩니다.
+To confirm the symptom, run `ss -tnp | grep <PID>` and look for `SYN-SENT`.
 
-### 검증과 압축
+### Validation and compaction
 
 ```bash
-# 검증 (생성 중에도 가능, nice로 우선순위 낮춤)
+# validation (safe during generation, niced down)
 nice -n 15 python tools/validate_dataset.py
 
-# 압축 (반드시 stop 후)
+# compaction (must stop first)
 ./tools/run.sh stop
-python tools/compact_dataset.py           # 미리보기
-python tools/compact_dataset.py --apply   # 적용
+python tools/compact_dataset.py           # dry run
+python tools/compact_dataset.py --apply   # apply
 ./tools/run.sh start
 ```
 
-압축은 새 파일을 먼저 쓰고 검증한 뒤에 원본을 지웁니다. 중간에 실패해도 원본이 남습니다.
+Compaction writes new files, verifies them, and only then deletes the originals. If it fails midway the originals remain.
 
-별도 디렉토리에서 실험을 돌린 뒤 본 출력에 병합하면 중복이 생길 수 있습니다. 같은 출력 디렉토리를 쓰면 재개 로직이 막아줍니다.
+Running experiments in a separate output directory and merging them back can introduce duplicates. Using the same output directory lets the resume logic prevent this.
 
-### 학습 시 train과 val은 clip_id 단위로 나눌 것
+### Split train and val by clip_id, not by t0
 
-t0 간격이 2초인데 예측 지평이 6.4초라 인접 t0끼리 미래 궤적의 70%가 겹칩니다. t0로 쪼개면 val에 train과 거의 같은 장면이 들어가 성능이 부풀려집니다.
+t0 spacing is 2 seconds while the prediction horizon is 6.4 seconds, so adjacent t0 windows share about 70 percent of their future trajectory. Splitting by t0 puts nearly identical scenes in both sets and inflates measured performance.
 
-## 데이터 읽기
+## Reading the data
 
 ```python
 import pyarrow.parquet as pq, glob, numpy as np, io
@@ -231,15 +231,15 @@ fr = f[(f.clip_id == r.clip_id) & (f.t0_us == r.t0_us)].iloc[0]
 imgs = [np.array(Image.open(io.BytesIO(b))) for b in fr.jpegs]
 ```
 
-카메라 순서는 항상 0부터 6까지 고정입니다. cross_left, front_wide, cross_right, rear_left, rear_tele, rear_right, front_tele 순이고 각 카메라마다 프레임 4장이 이어집니다.
+Camera order is always 0 through 6: cross_left, front_wide, cross_right, rear_left, rear_tele, rear_right, front_tele. Each camera contributes 4 consecutive frames.
 
-`pass_filter`는 `ade <= 1.0m` 여부를 표시하는 참고용 플래그입니다. ADE 원본이 저장돼 있어 임계값을 나중에 바꿔도 재생성이 필요 없습니다.
+`pass_filter` is an advisory flag marking whether `ade <= 1.0m`. The raw ADE is stored, so the threshold can be changed later without regenerating anything.
 
-## 관련 저장소
+## Related repositories
 
-이 코드는 다음 NVIDIA 저장소에 의존합니다.
+This code depends on the following NVIDIA repositories.
 
-1. NVlabs/alpamayo2 : 34B 추론 코드
-2. NVlabs/alpamayo-recipes : SFT와 RL post training 레시피 (Alpamayo 1.5용)
-3. nvidia/Alpamayo2-Super : 모델 가중치 (gated)
-4. nvidia/PhysicalAI-Autonomous-Vehicles : 원본 주행 데이터 (gated)
+1. NVlabs/alpamayo2 : 34B inference code
+2. NVlabs/alpamayo-recipes : SFT and RL post training recipes (for Alpamayo 1.5)
+3. nvidia/Alpamayo2-Super : model weights (gated)
+4. nvidia/PhysicalAI-Autonomous-Vehicles : source driving data (gated)
