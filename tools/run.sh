@@ -71,7 +71,9 @@ status)
   echo "--- last progress per worker ---"
   for f in "$BIG"/logs/gen34_w*.log; do
     [ -f "$f" ] || continue
-    printf "%s: %s\n" "$(basename "$f" .log)" "$(grep 'cum t0' "$f" 2>/dev/null | tail -1 | cut -c1-110)"
+    # anchor on the timestamp and clip counter prefix, which is language independent
+    # (logs written before the English translation use a Korean progress label)
+    printf "%s: %s\n" "$(basename "$f" .log)" "$(grep -E '^\[[0-9:]+\] \[[0-9]+/[0-9]+\]' "$f" 2>/dev/null | tail -1 | cut -c1-110)"
   done
   echo "--- GPU ---"
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
